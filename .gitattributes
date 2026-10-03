@@ -1,0 +1,12 @@
+# Windows batch files use CRLF
+*.bat text eol=crlf
+
+# Everything else normalized to LF on commit
+* text=auto eol=lf
+
+# Binary files — don't touch
+*.bin binary
+*.fd binary
+*.img binary
+*.elf binary
+*.efi binary
