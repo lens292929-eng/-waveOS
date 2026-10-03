@@ -845,11 +845,6 @@ static void cmd_pwd(int argc, char **argv) {
     printc('\n');
 }
 
-static void cmd_waveey(int argc, char **argv) {
-    (void)argc; (void)argv;
-    print("waveey\n");
-}
-
 static void cmd_shutdown(int argc, char **argv) {
     (void)argc; (void)argv;
     wfs_save();
@@ -981,7 +976,6 @@ static const struct command commands[] = {
     { "tree",     cmd_tree,      "show directory tree" },
     { "uptime",   print_uptime,  "shows how long the computer has been running for" },
     { "version",  cmd_version,   "kernel version" },
-    { "waveey",   cmd_waveey,    "waveey" },
     { "wss",      cmd_wss,       "run a .wss script" },
 
     { NULL, NULL, NULL },
