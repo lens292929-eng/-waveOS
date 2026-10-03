@@ -4,6 +4,12 @@ waveOS is a small experimental x86-64 operating system built from scratch.
 
 It is not trying to replace Windows, Linux, or macOS. It is mostly an excuse to write low-level code and see how far it can go.
 
+## Screenshots
+
+![waveOS running in QEMU](qemu.png)
+
+![waveOS running in QEMU](qemu2.png)
+
 ## What It Has
 
 ### Bootloader
