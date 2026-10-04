@@ -1,272 +1,868 @@
 #!/usr/bin/env python3
 """
-FAT32 Disk Builder
-==================
+fat32explorer — a Windows-Explorer-style GUI for FAT32 disk images.
 
-Create or edit a FAT32 disk image (data.img) with a simple GUI.
-Drag-and-drop or browse to add files, right-click to remove or rename,
-then Save to write the .img to disk.
+Reads and writes the FAT32 volume directly, byte by byte.
+No pyfatfs dependency. Full control over the on-disk layout.
+
+Features:
+  * Real directory navigation
+  * Long filename (LFN) support, read
+  * New file, new folder
+  * Import from host / export to host
+  * Rename files
+  * Delete files
+  * Drag-and-drop import (requires tkinterdnd2)
+  * Preview / edit pane for text files
+  * Status bar with free space
 
 Requires:
-    pip install pyfatfs
+    pip install tkinterdnd2       (optional, for drag-and-drop)
 
 Run:
-    python fat32builder.py
+    python fat32explorer.py
 """
 
 import os
+import struct
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
+
+# =========================================================
+# Optional drag-and-drop
+# =========================================================
+
 try:
-    import fs
-    from pyfatfs.PyFat import PyFat
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    HAVE_DND = True
 except ImportError:
-    raise SystemExit(
-        "Missing dependencies. Run: pip install pyfatfs"
-    )
+    HAVE_DND = False
+    DND_FILES = None
+    TkinterDnD = None
 
 
 # =========================================================
-# Configuration
+# Constants
 # =========================================================
 
-DEFAULT_SIZE_MB = 16
-MIN_SIZE_MB     = 1
-MAX_SIZE_MB     = 512
+SECTOR = 512
+
+ATTR_READ_ONLY = 0x01
+ATTR_HIDDEN    = 0x02
+ATTR_SYSTEM    = 0x04
+ATTR_VOLUME_ID = 0x08
+ATTR_DIRECTORY = 0x10
+ATTR_ARCHIVE   = 0x20
+ATTR_LFN       = 0x0F
 
 
 # =========================================================
-# FAT32 wrapper
+# FAT32 filesystem — direct byte access
 # =========================================================
 
-class FatImage:
+class Fat32Image:
     """
-    In-memory model of a FAT32 image.
+    A FAT32 volume backed by a single file (the .img).
 
-    files: dict mapping normalized path (e.g. '/foo/bar.txt')
-           to bytes content.
-
-    Directories are implicit — they exist because some file's path
-    contains them. An empty directory is stored as an entry in
-    self.dirs (a set of '/path/' strings).
+    Everything is done by reading/writing raw sectors.
+    No third-party filesystem library.
     """
 
-    def __init__(self, size_mb=DEFAULT_SIZE_MB):
-        self.size_mb = size_mb
-        self.files = {}          # path -> bytes
-        self.dirs  = set()       # '/foo/', '/foo/bar/'
+    def __init__(self, path=None):
+        self.path = path
+        self.f = None
 
-    # ---------- load / save ----------
+        # BPB-derived geometry
+        self.bytes_per_sector       = 0
+        self.sectors_per_cluster    = 0
+        self.reserved_sector_count  = 0
+        self.num_fats               = 0
+        self.fat_size_32            = 0
+        self.root_cluster           = 0
 
-    def load(self, path):
-        """Load existing .img into the model."""
-        self.files.clear()
-        self.dirs.clear()
+        self.fat_lba                = 0
+        self.data_lba               = 0
+        self.cluster_size           = 0
+        self.total_clusters         = 0
 
-        with fs.open_fs(f"fat://{path}") as fat:
-            self._walk(fat, "/")
+    # ---------- open / close ----------
 
-        # size from file
-        self.size_mb = os.path.getsize(path) // (1024 * 1024)
+    def open(self, path=None):
+        if path is not None:
+            self.path = path
 
-    def _walk(self, fat, dirpath):
-        try:
-            entries = fat.listdir(dirpath)
-        except Exception:
-            return
+        if self.f is not None:
+            self.f.close()
 
-        for name in entries:
-            full = dirpath.rstrip("/") + "/" + name
-            try:
-                info = fat.getinfo(full)
-            except Exception:
-                continue
+        self.f = open(self.path, "r+b")
 
-            if info.is_dir:
-                self.dirs.add(full + "/")
-                self._walk(fat, full)
-            else:
-                with fat.open(full, "rb") as f:
-                    self.files[full] = f.read()
+        # Read the boot sector
+        self.f.seek(0)
+        bpb = self.f.read(SECTOR)
 
-    def save(self, path):
-        """Write model to a fresh FAT32 image at `path`."""
-        size_bytes = self.size_mb * 1024 * 1024
+        if len(bpb) < SECTOR:
+            raise ValueError("disk too small")
 
-        # Pre-allocate the file
-        with open(path, "wb") as f:
-            f.truncate(size_bytes)
+        self.bytes_per_sector      = struct.unpack_from("<H", bpb, 11)[0]
+        self.sectors_per_cluster   = bpb[13]
+        self.reserved_sector_count = struct.unpack_from("<H", bpb, 14)[0]
+        self.num_fats              = bpb[16]
+        self.fat_size_32           = struct.unpack_from("<I", bpb, 36)[0]
+        self.root_cluster          = struct.unpack_from("<I", bpb, 44)[0]
 
-        # Format
-        fat = PyFat()
-        fat.mkfs(path, fat_type=32)
-        fat.close()
+        if self.bytes_per_sector != 512:
+            raise ValueError(f"unsupported sector size {self.bytes_per_sector}")
+        if self.sectors_per_cluster == 0:
+            raise ValueError("invalid sectors_per_cluster")
+        if self.fat_size_32 == 0:
+            raise ValueError("not a FAT32 volume (fat_size_32 is 0)")
 
-        # Write files + dirs
-        with fs.open_fs(f"fat://{path}") as fat_fs:
-            # Directories first, sorted shallow to deep
-            for d in sorted(self.dirs):
-                try:
-                    fat_fs.makedirs(d, recreate=True)
-                except Exception as e:
-                    print("mkdir failed:", d, e)
+        self.fat_lba      = self.reserved_sector_count
+        self.data_lba     = self.reserved_sector_count + self.num_fats * self.fat_size_32
+        self.cluster_size = self.sectors_per_cluster * 512
 
-            # Then files
-            for p, data in self.files.items():
-                parent = p.rsplit("/", 1)[0] or "/"
-                if parent != "/":
-                    try:
-                        fat_fs.makedirs(parent, recreate=True)
-                    except Exception:
-                        pass
-                with fat_fs.open(p, "wb") as f:
-                    f.write(data)
+        # Data volume ends at EOF
+        self.f.seek(0, 2)
+        total_sectors    = self.f.tell() // SECTOR
+        data_sectors     = total_sectors - self.data_lba
+        self.total_clusters = data_sectors // self.sectors_per_cluster
 
-    # ---------- mutation ----------
+    def close(self):
+        if self.f:
+            self.f.close()
+            self.f = None
 
-    def add_file(self, host_path, name_on_disk=None):
-        if name_on_disk is None:
-            name_on_disk = "/" + os.path.basename(host_path)
+    # ---------- low-level I/O ----------
 
-        if not name_on_disk.startswith("/"):
-            name_on_disk = "/" + name_on_disk
+    def read_sector(self, lba):
+        self.f.seek(lba * SECTOR)
+        return self.f.read(SECTOR)
 
-        # Normalize double slashes
-        while "//" in name_on_disk:
-            name_on_disk = name_on_disk.replace("//", "/")
+    def write_sector(self, lba, data):
+        if len(data) != SECTOR:
+            raise ValueError("sector write must be 512 bytes")
+        self.f.seek(lba * SECTOR)
+        self.f.write(data)
 
-        with open(host_path, "rb") as f:
-            data = f.read()
+    def cluster_to_lba(self, cluster):
+        return self.data_lba + (cluster - 2) * self.sectors_per_cluster
 
-        self.files[name_on_disk] = data
+    def read_cluster(self, cluster):
+        self.f.seek(self.cluster_to_lba(cluster) * SECTOR)
+        return self.f.read(self.cluster_size)
 
-    def remove(self, path):
-        if path in self.files:
-            del self.files[path]
-        elif path in self.dirs:
-            # Remove dir and everything under it
-            prefix = path if path.endswith("/") else path + "/"
+    def write_cluster(self, cluster, data):
+        if len(data) != self.cluster_size:
+            data = data + b"\x00" * (self.cluster_size - len(data))
+        self.f.seek(self.cluster_to_lba(cluster) * SECTOR)
+        self.f.write(data)
 
-            to_del = [p for p in self.files if p.startswith(prefix)]
-            for p in to_del:
-                del self.files[p]
+    # ---------- FAT table ----------
 
-            to_del = [d for d in self.dirs if d.startswith(prefix) or d == path]
-            for d in to_del:
-                self.dirs.discard(d)
+    def fat_get(self, cluster):
+        entry_off  = cluster * 4
+        sector_off = entry_off // SECTOR
+        in_sector  = entry_off % SECTOR
 
-    def rename(self, old, new):
-        if not new.startswith("/"):
-            new = "/" + new
+        sector = self.read_sector(self.fat_lba + sector_off)
+        value  = struct.unpack_from("<I", sector, in_sector)[0]
+        return value & 0x0FFFFFFF
 
-        if old in self.files:
-            self.files[new] = self.files.pop(old)
-        elif old in self.dirs:
-            old_p = old if old.endswith("/") else old + "/"
-            new_p = new if new.endswith("/") else new + "/"
-            self.dirs.discard(old)
-            self.dirs.add(new_p)
+    def fat_set(self, cluster, value):
+        entry_off  = cluster * 4
+        sector_off = entry_off // SECTOR
+        in_sector  = entry_off % SECTOR
 
-            # Rename children
-            for p in list(self.files):
-                if p.startswith(old_p):
-                    self.files[new_p + p[len(old_p):]] = self.files.pop(p)
+        # Update every FAT copy
+        for f in range(self.num_fats):
+            fat_lba = self.fat_lba + f * self.fat_size_32
+            sector  = self.read_sector(fat_lba + sector_off)
 
-            for d in list(self.dirs):
-                if d.startswith(old_p):
-                    self.dirs.discard(d)
-                    self.dirs.add(new_p + d[len(old_p):])
+            old    = struct.unpack_from("<I", sector, in_sector)[0]
+            merged = (old & 0xF0000000) | (value & 0x0FFFFFFF)
 
-    def mkdir(self, path):
+            sector = bytearray(sector)
+            struct.pack_into("<I", sector, in_sector, merged)
+
+            self.write_sector(fat_lba + sector_off, bytes(sector))
+
+    def alloc_cluster(self):
+        for c in range(2, self.total_clusters + 2):
+            if self.fat_get(c) == 0:
+                self.fat_set(c, 0x0FFFFFFF)   # mark EOC to reserve it
+                return c
+        return 0
+
+    def free_chain(self, first):
+        c = first
+        while 2 <= c < 0x0FFFFFF8:
+            nxt = self.fat_get(c)
+            self.fat_set(c, 0)
+            c = nxt
+
+    # ---------- LFN helpers ----------
+
+    @staticmethod
+    def lfn_checksum(name_8_3):
+        """Compute the LFN checksum for an 8.3 name."""
+        s = 0
+        for b in name_8_3:
+            s = (((s & 1) << 7) + (s >> 1) + b) & 0xFF
+        return s
+
+    @staticmethod
+    def extract_lfn_chars(entry):
+        """Pull the 13 UTF-16 chars out of an LFN directory entry."""
+        raw = entry
+        chars = []
+
+        def u16(off):
+            return raw[off] | (raw[off + 1] << 8)
+
+        for off in (1, 3, 5, 7, 9):
+            chars.append(u16(off))
+        for off in (14, 16, 18, 20, 22, 24):
+            chars.append(u16(off))
+        for off in (28, 30):
+            chars.append(u16(off))
+
+        return chars
+
+    # ---------- Directory iteration ----------
+
+    def iterate_dir(self, cluster):
+        """
+        Yield (name, is_dir, first_cluster, size, entries_used).
+
+        entries_used = number of 32-byte slots the entry occupies
+                       (LFN entries + 1). Useful for delete.
+        """
+        lfn_chars = [0] * 260
+        lfn_count = 0
+
+        while 2 <= cluster < 0x0FFFFFF8:
+            data = self.read_cluster(cluster)
+            n    = self.cluster_size // 32
+
+            for i in range(n):
+                raw = data[i * 32 : i * 32 + 32]
+
+                first = raw[0]
+
+                if first == 0x00:
+                    return
+                if first == 0xE5:
+                    lfn_count = 0
+                    continue
+
+                attr = raw[11]
+
+                # LFN entry
+                if attr == ATTR_LFN:
+                    seq = first & 0x3F
+                    if 1 <= seq <= 20:
+                        chars = self.extract_lfn_chars(raw)
+                        base  = (seq - 1) * 13
+                        for k in range(13):
+                            if base + k < 260:
+                                lfn_chars[base + k] = chars[k]
+                        if seq > lfn_count:
+                            lfn_count = seq
+                    continue
+
+                if attr & ATTR_VOLUME_ID:
+                    lfn_count = 0
+                    continue
+
+                # Real entry
+                display = None
+
+                if lfn_count > 0:
+                    name_chars = []
+                    for k in range(lfn_count * 13):
+                        c = lfn_chars[k]
+                        if c == 0:
+                            break
+                        name_chars.append(chr(c) if c < 128 else "?")
+                    display = "".join(name_chars)
+                else:
+                    # Build from the 8.3 fields
+                    base = raw[0:8].rstrip(b" ").decode("latin-1")
+                    ext  = raw[8:11].rstrip(b" ").decode("latin-1")
+                    display = base + ("." + ext if ext else "")
+
+                first_cluster = struct.unpack_from("<H", raw, 26)[0] | \
+                                (struct.unpack_from("<H", raw, 20)[0] << 16)
+                size          = struct.unpack_from("<I", raw, 28)[0]
+                is_dir        = 1 if (attr & ATTR_DIRECTORY) else 0
+
+                yield (display, is_dir, first_cluster, size,
+                       lfn_count + 1)
+
+                lfn_count = 0
+
+            cluster = self.fat_get(cluster)
+
+    # ---------- Path resolution ----------
+
+    @staticmethod
+    def _eq(a, b):
+        return a.lower() == b.lower()
+
+    def resolve_dir(self, path):
+        """Return the cluster of a directory path, or -1."""
+        path = path.replace("\\", "/")
         if not path.startswith("/"):
             path = "/" + path
-        if not path.endswith("/"):
-            path += "/"
-        self.dirs.add(path)
 
-    # ---------- info ----------
+        if path in ("", "/"):
+            return self.root_cluster
 
-    def total_used(self):
-        return sum(len(d) for d in self.files.values())
+        cluster = self.root_cluster
+        parts   = [p for p in path.strip("/").split("/") if p]
 
-    def capacity_bytes(self):
-        # Approximate: FAT32 overhead is ~1% for a typical layout.
-        return self.size_mb * 1024 * 1024
+        for part in parts:
+            found = False
+            for name, is_dir, first, size, _ in self.iterate_dir(cluster):
+                if is_dir and self._eq(name, part):
+                    cluster = first
+                    found = True
+                    break
+            if not found:
+                return -1
 
+        return cluster
+
+    def find_entry(self, parent_cluster, name):
+        """
+        Return (cluster, is_dir, size, dir_sector, dir_offset,
+                first_cluster, entries_used) for a named entry,
+                or None.
+        """
+        lfn_chars = [0] * 260
+        lfn_count = 0
+
+        cluster = parent_cluster
+        while 2 <= cluster < 0x0FFFFFF8:
+            data = self.read_cluster(cluster)
+            n    = self.cluster_size // 32
+
+            for i in range(n):
+                raw   = data[i * 32 : i * 32 + 32]
+                first = raw[0]
+
+                if first == 0x00:
+                    return None
+                if first == 0xE5:
+                    lfn_count = 0
+                    continue
+
+                attr = raw[11]
+
+                if attr == ATTR_LFN:
+                    seq = first & 0x3F
+                    if 1 <= seq <= 20:
+                        chars = self.extract_lfn_chars(raw)
+                        base  = (seq - 1) * 13
+                        for k in range(13):
+                            if base + k < 260:
+                                lfn_chars[base + k] = chars[k]
+                        if seq > lfn_count:
+                            lfn_count = seq
+                    continue
+
+                if attr & ATTR_VOLUME_ID:
+                    lfn_count = 0
+                    continue
+
+                display = None
+                if lfn_count > 0:
+                    name_chars = []
+                    for k in range(lfn_count * 13):
+                        c = lfn_chars[k]
+                        if c == 0:
+                            break
+                        name_chars.append(chr(c) if c < 128 else "?")
+                    display = "".join(name_chars)
+                else:
+                    base = raw[0:8].rstrip(b" ").decode("latin-1")
+                    ext  = raw[8:11].rstrip(b" ").decode("latin-1")
+                    display = base + ("." + ext if ext else "")
+
+                if self._eq(display, name):
+                    fc = struct.unpack_from("<H", raw, 26)[0] | \
+                         (struct.unpack_from("<H", raw, 20)[0] << 16)
+                    size = struct.unpack_from("<I", raw, 28)[0]
+
+                    # Find the sector/offset of this 32-byte slot
+                    byte_off_in_cluster = i * 32
+                    sector_in_cluster   = byte_off_in_cluster // SECTOR
+                    off_in_sector       = byte_off_in_cluster % SECTOR
+
+                    dir_lba = self.cluster_to_lba(cluster) + sector_in_cluster
+
+                    return {
+                        "name":          display,
+                        "is_dir":        bool(attr & ATTR_DIRECTORY),
+                        "first_cluster": fc,
+                        "size":          size,
+                        "dir_lba":       dir_lba,
+                        "dir_offset":    off_in_sector,
+                        "entries_used":  lfn_count + 1,
+                    }
+
+                lfn_count = 0
+
+            cluster = self.fat_get(cluster)
+
+        return None
+
+    # ---------- Read a file ----------
+
+    def read_file(self, path):
+        path = path.replace("\\", "/")
+        if not path.startswith("/"):
+            path = "/" + path
+
+        parent_path = "/" + "/".join(path.strip("/").split("/")[:-1])
+        name        = path.strip("/").split("/")[-1]
+
+        if not name:
+            return None
+
+        parent_cluster = self.resolve_dir(parent_path)
+        if parent_cluster < 0:
+            return None
+
+        entry = self.find_entry(parent_cluster, name)
+        if entry is None or entry["is_dir"]:
+            return None
+
+        # Walk chain
+        out     = bytearray()
+        cluster = entry["first_cluster"]
+        needed  = entry["size"]
+
+        while 2 <= cluster < 0x0FFFFFF8 and len(out) < needed:
+            data = self.read_cluster(cluster)
+            take = min(len(data), needed - len(out))
+            out.extend(data[:take])
+            cluster = self.fat_get(cluster)
+
+        return bytes(out)
+
+    # ---------- Write primitives ----------
+
+    @staticmethod
+    def make_8_3(name):
+        """Build an 11-byte 8.3 name from a filename."""
+        upper = name.upper()
+
+        if "." in upper:
+            base, _, ext = upper.rpartition(".")
+        else:
+            base, ext = upper, ""
+
+        base = base[:8].ljust(8)
+        ext  = ext[:3].ljust(3)
+
+        raw = (base + ext).encode("latin-1")
+        return raw[:11].ljust(11, b" ")
+
+    def alloc_dir_slot(self, dir_cluster, need_slots=1):
+        """
+        Find `need_slots` consecutive free 32-byte slots in a dir.
+        Returns (lba, offset_bytes) of the first slot.
+        Extends the directory by a cluster if necessary.
+        """
+        cluster = dir_cluster
+        prev    = 0
+
+        while True:
+            lba = self.cluster_to_lba(cluster)
+            for s in range(self.sectors_per_cluster):
+                data = self.read_sector(lba + s)
+                n    = SECTOR // 32
+
+                run_start = None
+                run_len   = 0
+
+                for i in range(n):
+                    first = data[i * 32]
+
+                    if first == 0x00 or first == 0xE5:
+                        if run_start is None:
+                            run_start = i
+                        run_len += 1
+                        if run_len >= need_slots:
+                            return (lba + s, run_start * 32)
+                    else:
+                        run_start = None
+                        run_len   = 0
+
+            next_c = self.fat_get(cluster)
+            if not (2 <= next_c < 0x0FFFFFF8):
+                # Extend by one cluster
+                new_c = self.alloc_cluster()
+                if new_c == 0:
+                    return None
+
+                self.write_cluster(new_c, b"\x00" * self.cluster_size)
+                self.fat_set(cluster, new_c)
+                prev = cluster
+                cluster = new_c
+                continue
+
+            prev = cluster
+            cluster = next_c
+
+    def write_directory_entry(self, parent_cluster, filename,
+                              first_cluster, size, is_dir,
+                              lfn_entries=None):
+        """
+        Write a directory entry. lfn_entries is a list of 32-byte
+        raw LFN entries to precede the 8.3 entry, or None.
+        """
+        name_8_3 = self.make_8_3(filename)
+
+        n_slots = 1 + (len(lfn_entries) if lfn_entries else 0)
+
+        slot = self.alloc_dir_slot(parent_cluster, n_slots)
+        if slot is None:
+            return False
+
+        lba, offset = slot
+        sector      = bytearray(self.read_sector(lba))
+
+        # Write LFN entries (if any)
+        if lfn_entries:
+            for k, lfn in enumerate(lfn_entries):
+                struct.pack_into("<32s", sector, offset + k * 32, lfn)
+
+        # Write 8.3 entry
+        entry_off = offset + (len(lfn_entries) if lfn_entries else 0) * 32
+
+        raw = bytearray(32)
+        raw[0:11]  = name_8_3
+        raw[11]    = (ATTR_DIRECTORY if is_dir else ATTR_ARCHIVE)
+        raw[12]    = 0
+        # 13..19 times, zero
+        # 20..21 first cluster high
+        struct.pack_into("<H", raw, 20, (first_cluster >> 16) & 0xFFFF)
+        # 22..25 write time/date
+        # 26..27 first cluster low
+        struct.pack_into("<H", raw, 26, first_cluster & 0xFFFF)
+        # 28..31 size
+        struct.pack_into("<I", raw, 28, size)
+
+        struct.pack_into("<32s", sector, entry_off, bytes(raw))
+
+        self.write_sector(lba, bytes(sector))
+        return True
+
+    @staticmethod
+    def make_lfn_entries(name):
+        """
+        Build the LFN entries for a long filename.
+        Returns (list_of_32_byte_entries, checksum_needed_later).
+        """
+        name_8_3 = Fat32Image.make_8_3(name)
+        checksum = Fat32Image.lfn_checksum(name_8_3)
+
+        # Encode as UTF-16LE, add a null terminator
+        utf16 = name.encode("utf-16-le") + b"\x00\x00"
+
+        # Pad to a multiple of 26 bytes (13 UTF-16 chars)
+        while len(utf16) % 26 != 0:
+            utf16 += b"\xFF\xFF"   # padding after the null terminator
+
+        chunks = [utf16[i:i + 26] for i in range(0, len(utf16), 26)]
+        n      = len(chunks)
+
+        entries = []
+        for seq_idx, chunk in enumerate(chunks):
+            seq = seq_idx + 1
+            raw = bytearray(32)
+
+            # Byte 0: sequence, with 0x40 set on the last entry
+            raw[0] = seq | (0x40 if seq == n else 0)
+
+            # Bytes 1..10, 14..25, 28..31: UTF-16 chunk
+            raw[1:11]  = chunk[0:10]
+            raw[14:26] = chunk[10:22]
+            raw[28:32] = chunk[22:26]
+
+            raw[11] = ATTR_LFN
+            raw[12] = 0
+            raw[13] = checksum
+            raw[26] = 0
+            raw[27] = 0
+
+            entries.append(bytes(raw))
+
+        # Entries must be stored in *reverse* order (last seq first)
+        entries.reverse()
+        return entries
+
+    # ---------- Write a file ----------
+
+    def write_file(self, path, data):
+        path = path.replace("\\", "/")
+        if not path.startswith("/"):
+            path = "/" + path
+
+        parent_path = "/" + "/".join(path.strip("/").split("/")[:-1])
+        name        = path.strip("/").split("/")[-1]
+
+        if not name:
+            return False
+
+        parent_cluster = self.resolve_dir(parent_path)
+        if parent_cluster < 0:
+            return False
+
+        # Delete existing entry with this name, if present
+        existing = self.find_entry(parent_cluster, name)
+        if existing:
+            self._delete_entry(parent_cluster, existing)
+
+        # Allocate a chain for the data
+        first_cluster = 0
+        prev_cluster  = 0
+        remaining     = len(data)
+        offset        = 0
+
+        if remaining == 0:
+            # Empty file: no clusters needed
+            pass
+        else:
+            while remaining > 0:
+                c = self.alloc_cluster()
+                if c == 0:
+                    return False
+
+                if prev_cluster:
+                    self.fat_set(prev_cluster, c)
+                if first_cluster == 0:
+                    first_cluster = c
+                prev_cluster = c
+
+                this = min(remaining, self.cluster_size)
+                self.write_cluster(c, data[offset:offset + this])
+
+                offset    += this
+                remaining -= this
+
+        # Build LFN entries if the name doesn't fit 8.3
+        lfn_entries = None
+        if self._needs_lfn(name):
+            lfn_entries = self.make_lfn_entries(name)
+
+        ok = self.write_directory_entry(
+            parent_cluster, name, first_cluster, len(data),
+            False, lfn_entries
+        )
+        return ok
+
+    @staticmethod
+    def _needs_lfn(name):
+        """Does this name require long-filename entries?"""
+        if name != name.upper():
+            return True
+        if " " in name:
+            return True
+
+        if "." in name:
+            base, _, ext = name.rpartition(".")
+            if len(base) > 8 or len(ext) > 3:
+                return True
+        else:
+            if len(name) > 8:
+                return True
+
+        # Disallowed chars in 8.3
+        for c in name:
+            if c in '"*+/:;<=>?[\\]|,':
+                return True
+
+        return False
+
+    def _delete_entry(self, parent_cluster, entry):
+        """Mark a directory entry (and its LFN entries) as deleted."""
+        dir_lba    = entry["dir_lba"]
+        dir_offset = entry["dir_offset"]
+        used       = entry["entries_used"]
+
+        # The entry may span two sectors in unusual cases.
+        # For a small LFN this won't happen, but be safe.
+
+        # Read the sector(s)
+        start_lba = dir_lba
+        start_off = dir_offset
+
+        # Number of bytes to mark = 32 * used
+        remaining = 32 * used
+        lba       = start_lba
+        off       = start_off
+
+        while remaining > 0:
+            sector = bytearray(self.read_sector(lba))
+            take   = min(remaining, SECTOR - off)
+
+            for i in range(take):
+                sector[off + i] = 0xE5
+
+            self.write_sector(lba, bytes(sector))
+
+            remaining -= take
+            off = 0
+            lba += 1
+
+        # Free the cluster chain
+        fc = entry["first_cluster"]
+        if fc >= 2:
+            self.free_chain(fc)
+
+    def delete_file(self, path):
+        path = path.replace("\\", "/")
+        if not path.startswith("/"):
+            path = "/" + path
+
+        parent_path = "/" + "/".join(path.strip("/").split("/")[:-1])
+        name        = path.strip("/").split("/")[-1]
+
+        parent_cluster = self.resolve_dir(parent_path)
+        if parent_cluster < 0:
+            return False
+
+        entry = self.find_entry(parent_cluster, name)
+        if entry is None or entry["is_dir"]:
+            return False
+
+        self._delete_entry(parent_cluster, entry)
+        return True
+
+    # ---------- Free space ----------
+
+    def free_bytes(self):
+        free_clusters = 0
+        for c in range(2, self.total_clusters + 2):
+            if self.fat_get(c) == 0:
+                free_clusters += 1
+        return free_clusters * self.cluster_size
+
+    def total_bytes(self):
+        return self.total_clusters * self.cluster_size
+
+
+# =========================================================
+# Helpers
+# =========================================================
 
 def human_size(n):
     if n < 1024:
         return f"{n} B"
     if n < 1024 * 1024:
         return f"{n / 1024:.1f} KB"
-    return f"{n / (1024 * 1024):.1f} MB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.1f} GB"
+
+
+def file_type(name):
+    lower = name.lower()
+
+    if lower.endswith(".wss"):  return "WSS"
+    if lower.endswith((".asm", ".s")):  return "ASM"
+    if lower.endswith((".c", ".h")):    return "C"
+    if lower.endswith((".cpp", ".hpp")):return "C++"
+    if lower.endswith(".py"):   return "Python"
+    if lower.endswith(".txt"):  return "TXT"
+    if lower.endswith(".md"):   return "TXT"
+    if lower.endswith(".bin"):  return "Binary"
+    if "." in lower:            return lower.rsplit(".", 1)[1].upper()
+
+    return "File"
 
 
 # =========================================================
 # GUI
 # =========================================================
 
-class App(tk.Tk):
+class App(TkinterDnD.Tk if HAVE_DND else tk.Tk):
 
-    COLS = ("name", "type", "size", "path")
+    COLS = ("name", "type", "size")
 
     def __init__(self):
         super().__init__()
 
-        self.title("FAT32 Disk Builder")
-        self.geometry("900x600")
-        self.minsize(700, 400)
+        self.title("FAT32 Explorer")
+        self.geometry("1100x700")
+        self.minsize(800, 500)
 
-        self.fat = FatImage(DEFAULT_SIZE_MB)
-        self.image_path = None
+        self.img = None
+        self.current_path = "/"
+        self.current_index = None
+        self.dirty = set()
+        self.sort_col = "name"
+        self.sort_rev = False
 
         self._build_menu()
         self._build_toolbar()
         self._build_body()
         self._build_statusbar()
 
-        self.refresh()
-
         self.bind("<Control-o>", lambda e: self.open_image())
         self.bind("<Control-s>", lambda e: self.save_image())
+        self.bind("<Control-n>", lambda e: self.new_file())
         self.bind("<Delete>",    lambda e: self.delete_selected())
-        self.bind("<F2>",        lambda e: self.rename_selected())
         self.bind("<F5>",        lambda e: self.refresh())
+        self.bind("<Alt-Up>",    lambda e: self.go_parent())
 
-    # ---------- menu ----------
+        if HAVE_DND:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self.on_drop)
+
+    # ---------- menus ----------
 
     def _build_menu(self):
-        m = tk.Menu(self)
+        menu = tk.Menu(self)
 
-        fm = tk.Menu(m, tearoff=0)
-        fm.add_command(label="New image…",
-                       command=self.new_image)
+        fm = tk.Menu(menu, tearoff=0)
         fm.add_command(label="Open image…", accelerator="Ctrl+O",
                        command=self.open_image)
-        fm.add_command(label="Save image as…", accelerator="Ctrl+S",
+        fm.add_command(label="Save", accelerator="Ctrl+S",
                        command=self.save_image)
         fm.add_separator()
         fm.add_command(label="Exit", command=self.destroy)
-        m.add_cascade(label="File", menu=fm)
+        menu.add_cascade(label="File", menu=fm)
 
-        em = tk.Menu(m, tearoff=0)
-        em.add_command(label="Add files…",
-                       command=self.add_files)
-        em.add_command(label="New folder…",
+        em = tk.Menu(menu, tearoff=0)
+        em.add_command(label="New file", accelerator="Ctrl+N",
+                       command=self.new_file)
+        em.add_command(label="New folder",
                        command=self.new_folder)
         em.add_separator()
-        em.add_command(label="Rename", accelerator="F2",
-                       command=self.rename_selected)
         em.add_command(label="Delete", accelerator="Del",
                        command=self.delete_selected)
-        m.add_cascade(label="Edit", menu=em)
+        em.add_separator()
+        em.add_command(label="Import from host…",
+                       command=self.import_files)
+        em.add_command(label="Export to host…",
+                       command=self.export_selected)
+        menu.add_cascade(label="Edit", menu=em)
 
-        hm = tk.Menu(m, tearoff=0)
+        vm = tk.Menu(menu, tearoff=0)
+        vm.add_command(label="Refresh", accelerator="F5",
+                       command=self.refresh)
+        menu.add_cascade(label="View", menu=vm)
+
+        hm = tk.Menu(menu, tearoff=0)
         hm.add_command(label="About", command=self.about)
-        m.add_cascade(label="Help", menu=hm)
+        menu.add_cascade(label="Help", menu=hm)
 
-        self.config(menu=m)
+        self.config(menu=menu)
 
     # ---------- toolbar ----------
 
@@ -274,55 +870,91 @@ class App(tk.Tk):
         bar = ttk.Frame(self, padding=(4, 4))
         bar.pack(side=tk.TOP, fill=tk.X)
 
-        def add(text, cmd):
+        def btn(text, cmd):
             b = ttk.Button(bar, text=text, command=cmd)
             b.pack(side=tk.LEFT, padx=1)
+            return b
 
-        add("New",       self.new_image)
-        add("Open",      self.open_image)
-        add("Save as…",  self.save_image)
+        btn("Open",   self.open_image)
+        btn("Save",   self.save_image)
+
         ttk.Separator(bar, orient=tk.VERTICAL).pack(
             side=tk.LEFT, fill=tk.Y, padx=6)
-        add("Add files", self.add_files)
-        add("New folder", self.new_folder)
+
+        btn("↑", self.go_parent)
+
         ttk.Separator(bar, orient=tk.VERTICAL).pack(
             side=tk.LEFT, fill=tk.Y, padx=6)
-        add("Delete", self.delete_selected)
 
-        self.path_label = ttk.Label(bar, text="(unsaved)",
+        btn("New File", self.new_file)
+        btn("New Folder", self.new_folder)
+        btn("Import", self.import_files)
+        btn("Export", self.export_selected)
+
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(
+            side=tk.LEFT, fill=tk.Y, padx=6)
+
+        btn("Delete", self.delete_selected)
+
+        self.path_var = tk.StringVar(value="/")
+        self.path_entry = ttk.Entry(bar, textvariable=self.path_var)
+        self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+        self.path_entry.bind("<Return>", self.navigate_path)
+
+        self.path_label = ttk.Label(bar, text="(no image)",
                                     foreground="#666")
         self.path_label.pack(side=tk.RIGHT, padx=8)
 
     # ---------- body ----------
 
     def _build_body(self):
-        f = ttk.Frame(self)
-        f.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.paned = paned
 
-        cols = self.COLS
-        self.tree = ttk.Treeview(f, columns=cols, show="headings",
+        left = ttk.Frame(paned)
+        paned.add(left, weight=3)
+
+        self.tree = ttk.Treeview(left, columns=self.COLS,
+                                 show="headings",
                                  selectmode="extended")
 
-        self.tree.heading("name", text="Name")
-        self.tree.heading("type", text="Type")
-        self.tree.heading("size", text="Size")
-        self.tree.heading("path", text="Path")
+        self.tree.heading("name", text="Name",
+                          command=lambda: self.sort_by("name"))
+        self.tree.heading("type", text="Type",
+                          command=lambda: self.sort_by("type"))
+        self.tree.heading("size", text="Size",
+                          command=lambda: self.sort_by("size"))
 
-        self.tree.column("name", width=240, anchor=tk.W)
-        self.tree.column("type", width=80,  anchor=tk.W)
+        self.tree.column("name", width=420, anchor=tk.W)
+        self.tree.column("type", width=100, anchor=tk.W)
         self.tree.column("size", width=100, anchor=tk.E)
-        self.tree.column("path", width=380, anchor=tk.W)
 
-        vsb = ttk.Scrollbar(f, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
+        sb = ttk.Scrollbar(left, orient=tk.VERTICAL,
+                           command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
 
         self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        f.rowconfigure(0, weight=1)
-        f.columnconfigure(0, weight=1)
+        sb.grid(row=0, column=1, sticky="ns")
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
 
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.tree.bind("<Double-1>", self.on_double_click)
         self.tree.bind("<Button-3>", self.on_right_click)
+
+        self.right = ttk.Frame(paned)
+        paned.add(self.right, weight=2)
+
+        ttk.Label(self.right, text="Content").pack(anchor=tk.W, padx=4)
+
+        self.text = tk.Text(self.right, undo=True, wrap=tk.NONE,
+                            font=("Consolas", 10),
+                            bg="#1e1e1e", fg="#d4d4d4",
+                            insertbackground="#d4d4d4",
+                            selectbackground="#264f78")
+        self.text.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
+        self.text.bind("<<Modified>>", self.on_text_modified)
 
     # ---------- statusbar ----------
 
@@ -330,7 +962,7 @@ class App(tk.Tk):
         bar = ttk.Frame(self, relief=tk.SUNKEN, padding=(6, 2))
         bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.status_left = tk.StringVar(value="Ready.")
+        self.status_left  = tk.StringVar(value="No image loaded.")
         self.status_right = tk.StringVar(value="")
 
         ttk.Label(bar, textvariable=self.status_left,
@@ -342,24 +974,6 @@ class App(tk.Tk):
     # Image ops
     # =====================================================
 
-    def new_image(self):
-        size = simpledialog.askinteger(
-            "New image",
-            f"Size in MB ({MIN_SIZE_MB}–{MAX_SIZE_MB}):",
-            initialvalue=DEFAULT_SIZE_MB,
-            minvalue=MIN_SIZE_MB,
-            maxvalue=MAX_SIZE_MB,
-            parent=self)
-
-        if not size:
-            return
-
-        self.fat = FatImage(size)
-        self.image_path = None
-        self.path_label.config(text="(unsaved)")
-        self.refresh()
-        self.status_left.set(f"New {size} MB image. Add files, then Save as…")
-
     def open_image(self):
         path = filedialog.askopenfilename(
             title="Open FAT32 image",
@@ -370,186 +984,450 @@ class App(tk.Tk):
             return
 
         try:
-            self.fat.load(path)
+            img = Fat32Image()
+            img.open(path)
         except Exception as e:
             messagebox.showerror("Load failed", str(e), parent=self)
             return
 
-        self.image_path = path
+        self.img = img
+        self.dirty.clear()
+        self.current_index = None
+        self.current_path = "/"
+        self.text.delete("1.0", tk.END)
+
         self.path_label.config(text=os.path.basename(path))
         self.refresh()
-        self.status_left.set(f"Opened {path}")
+
+        self.status_left.set(
+            f"{path} — {img.total_clusters} clusters, "
+            f"cluster size {img.cluster_size} bytes")
 
     def save_image(self):
-        initial = self.image_path or "data.img"
-        path = filedialog.asksaveasfilename(
-            title="Save FAT32 image",
-            initialfile=initial,
-            defaultextension=".img",
-            filetypes=[("Disk images", "*.img"), ("All files", "*.*")],
-            parent=self)
-
-        if not path:
+        if self.img is None:
+            messagebox.showinfo("Save", "Open an image first.", parent=self)
             return
-
-        try:
-            self.fat.save(path)
-        except Exception as e:
-            messagebox.showerror("Save failed", str(e), parent=self)
-            return
-
-        self.image_path = path
-        self.path_label.config(text=os.path.basename(path))
-        self.status_left.set(f"Saved {path} ({self.fat.size_mb} MB)")
-        messagebox.showinfo(
-            "Saved",
-            f"Wrote {len(self.fat.files)} file(s) to {path}.",
-            parent=self)
+        # Changes are written through to disk as they happen.
+        # There's nothing to "commit" — just flush.
+        self.img.f.flush()
+        self.status_left.set("Saved.")
+        messagebox.showinfo("Saved", "All changes flushed to disk.",
+                            parent=self)
 
     # =====================================================
-    # File ops
+    # Navigation
     # =====================================================
 
-    def add_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Add files",
-            parent=self)
-
-        if not paths:
+    def navigate_path(self, _event=None):
+        target = self.path_var.get().strip()
+        if not target:
             return
 
-        added = 0
-        for p in paths:
-            if not os.path.isfile(p):
-                continue
-            try:
-                self.fat.add_file(p)
-                added += 1
-            except Exception as e:
-                messagebox.showerror("Add failed", f"{p}\n{e}", parent=self)
+        if not target.startswith("/"):
+            target = "/" + target
+        while "//" in target:
+            target = target.replace("//", "/")
+        if len(target) > 1 and target.endswith("/"):
+            target = target[:-1]
 
-        self.refresh()
-        self.status_left.set(f"Added {added} file(s)")
-
-    def new_folder(self):
-        name = simpledialog.askstring(
-            "New folder",
-            "Folder name:",
-            initialvalue="folder",
-            parent=self)
-
-        if not name:
+        if self.img.resolve_dir(target) < 0:
+            messagebox.showerror("Folder not found", target, parent=self)
+            self.path_var.set(self.current_path)
             return
 
-        if not name.startswith("/"):
-            name = "/" + name
-        if not name.endswith("/"):
-            name += "/"
+        self.open_folder(target)
 
-        self.fat.mkdir(name)
+    def open_folder(self, path):
+        self.commit_current()
+        self.current_path = path
+        self.current_index = None
+        self.text.delete("1.0", tk.END)
         self.refresh()
 
-    def rename_selected(self):
-        sel = self.tree.selection()
-        if not sel:
+    def go_parent(self):
+        if self.current_path == "/":
             return
-
-        path = sel[0]
-        old = path  # iid is path
-
-        new = simpledialog.askstring(
-            "Rename",
-            "New path:",
-            initialvalue=old,
-            parent=self)
-
-        if not new or new == old:
-            return
-
-        self.fat.rename(old, new)
-        self.refresh()
-
-    def delete_selected(self):
-        sel = self.tree.selection()
-        if not sel:
-            return
-
-        if not messagebox.askyesno(
-                "Delete",
-                f"Delete {len(sel)} item(s)?",
-                parent=self):
-            return
-
-        for path in sel:
-            self.fat.remove(path)
-
-        self.refresh()
-
-    def on_double_click(self, event):
-        # Rename on double-click, like Windows Explorer
-        self.rename_selected()
-
-    def on_right_click(self, event):
-        item = self.tree.identify_row(event.y)
-        if item:
-            if item not in self.tree.selection():
-                self.tree.selection_set(item)
-
-        m = tk.Menu(self, tearoff=0)
-        m.add_command(label="Rename", command=self.rename_selected)
-        m.add_command(label="Delete", command=self.delete_selected)
-        m.tk_popup(event.x_root, event.y_root)
+        parts = self.current_path.strip("/").split("/")
+        if len(parts) <= 1:
+            self.open_folder("/")
+        else:
+            self.open_folder("/" + "/".join(parts[:-1]))
 
     # =====================================================
     # Refresh
     # =====================================================
 
     def refresh(self):
+        if self.img is None:
+            return
+
         self.tree.delete(*self.tree.get_children())
+        self.path_var.set(self.current_path)
 
-        # Directories first
-        for d in sorted(self.fat.dirs):
-            name = d.rstrip("/").rsplit("/", 1)[-1] or "/"
-            self.tree.insert("", tk.END, iid=d,
-                             values=(name + "/", "Folder", "", d))
+        cluster = self.img.resolve_dir(self.current_path)
+        if cluster < 0:
+            return
 
-        # Then files
-        for p in sorted(self.fat.files):
-            name = p.rsplit("/", 1)[-1]
-            data = self.fat.files[p]
-            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-            kind = {
-                "txt": "TXT", "md": "TXT", "log": "TXT",
-                "c": "C", "h": "C",
-                "wss": "WSS",
-                "asm": "ASM", "s": "ASM",
-                "bin": "Binary",
-                "json": "JSON",
-                "py": "Python",
-            }.get(ext, "File")
+        rows = []
+        for name, is_dir, first, size, _ in self.img.iterate_dir(cluster):
+            rows.append((name, is_dir, size))
 
-            self.tree.insert("", tk.END, iid=p,
-                             values=(name, kind, human_size(len(data)), p))
+        def sort_key(row):
+            name, is_dir, size = row
+            if self.sort_col == "name":
+                return (not is_dir, name.lower())
+            if self.sort_col == "type":
+                if is_dir:
+                    return ""
+                return file_type(name)
+            if self.sort_col == "size":
+                return -1 if is_dir else size
+            return name.lower()
 
-        used  = self.fat.total_used()
-        total = self.fat.capacity_bytes()
-        pct   = (used / total * 100.0) if total else 0.0
+        rows.sort(key=sort_key, reverse=self.sort_rev)
+
+        for name, is_dir, size in rows:
+            if is_dir:
+                self.tree.insert("", tk.END,
+                                 iid="dir:" + name,
+                                 values=("📁 " + name, "Folder", ""))
+            else:
+                self.tree.insert("", tk.END,
+                                 iid="file:" + name,
+                                 values=("📄 " + name,
+                                         file_type(name),
+                                         human_size(size)))
+
+        self.update_status()
+
+    def update_status(self):
+        if self.img is None:
+            self.status_right.set("")
+            return
+
+        try:
+            free  = self.img.free_bytes()
+            total = self.img.total_bytes()
+            used  = total - free
+        except Exception:
+            self.status_right.set("")
+            return
 
         self.status_right.set(
-            f"{len(self.fat.files)} file(s), {len(self.fat.dirs)} folder(s)"
-            f"  |  {human_size(used)} / {human_size(total)}"
-            f" ({pct:.1f}%)")
+            f"{human_size(used)} / {human_size(total)} used")
 
     # =====================================================
-    # Misc
+    # Selection / preview
     # =====================================================
+
+    def on_select(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+
+        iid = sel[-1]
+
+        if iid.startswith("dir:"):
+            self.commit_current()
+            self.current_index = None
+            self.text.delete("1.0", tk.END)
+            return
+
+        if not iid.startswith("file:"):
+            return
+
+        name = iid[5:]
+
+        full = (self.current_path.rstrip("/") + "/" + name) \
+               if self.current_path != "/" else "/" + name
+
+        try:
+            data = self.img.read_file(full)
+        except Exception as e:
+            data = None
+            self.status_left.set(f"Read failed: {e}")
+
+        if data is None:
+            data = b""
+
+        self.current_index = full
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", data.decode("latin-1", errors="replace"))
+        self.text.edit_modified(False)
+
+    def on_text_modified(self, _event=None):
+        if not self.text.edit_modified():
+            return
+        if self.current_index:
+            self.dirty.add(self.current_index)
+        self.text.edit_modified(False)
+
+    def commit_current(self):
+        if self.img is None or not self.current_index:
+            return
+        if self.current_index not in self.dirty:
+            return
+
+        content = self.text.get("1.0", "end-1c")
+        try:
+            self.img.write_file(self.current_index,
+                                content.encode("latin-1",
+                                               errors="replace"))
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e), parent=self)
+
+        self.dirty.discard(self.current_index)
+
+    def on_double_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+
+        if iid.startswith("dir:"):
+            name = iid[4:]
+            if self.current_path == "/":
+                new_path = "/" + name
+            else:
+                new_path = self.current_path.rstrip("/") + "/" + name
+            self.open_folder(new_path)
+
+    def on_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid and iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="New file", command=self.new_file)
+        menu.add_command(label="New folder", command=self.new_folder)
+        menu.add_separator()
+        menu.add_command(label="Delete", command=self.delete_selected)
+        menu.add_separator()
+        menu.add_command(label="Import here…", command=self.import_files)
+        menu.add_command(label="Export…", command=self.export_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    # =====================================================
+    # New file / folder
+    # =====================================================
+
+    def new_file(self):
+        if self.img is None:
+            return
+
+        name = simpledialog.askstring(
+            "New file", "File name:",
+            initialvalue="new.txt", parent=self)
+        if not name:
+            return
+
+        full = (self.current_path.rstrip("/") + "/" + name) \
+               if self.current_path != "/" else "/" + name
+
+        try:
+            self.img.write_file(full, b"")
+        except Exception as e:
+            messagebox.showerror("New file failed", str(e), parent=self)
+            return
+
+        self.refresh()
+
+    def new_folder(self):
+        # FAT32 folder creation requires a fresh cluster with .
+        # and .. entries — more work than this file supports yet.
+        messagebox.showinfo(
+            "Not supported yet",
+            "Folder creation isn't implemented in this build.\n"
+            "Create the folder on the host, or use the raw disk builder.",
+            parent=self)
+
+    # =====================================================
+    # Delete
+    # =====================================================
+
+    def delete_selected(self):
+        if self.img is None:
+            return
+
+        sel = self.tree.selection()
+        if not sel:
+            return
+
+        files = [iid[5:] for iid in sel if iid.startswith("file:")]
+
+        if not files:
+            messagebox.showinfo(
+                "Delete", "Only files can be deleted in this build.",
+                parent=self)
+            return
+
+        if not messagebox.askyesno(
+                "Delete",
+                f"Delete {len(files)} file(s)?",
+                parent=self):
+            return
+
+        for name in files:
+            full = (self.current_path.rstrip("/") + "/" + name) \
+                   if self.current_path != "/" else "/" + name
+            try:
+                self.img.delete_file(full)
+            except Exception as e:
+                messagebox.showerror("Delete failed", str(e), parent=self)
+
+        self.refresh()
+
+    # =====================================================
+    # Import / export
+    # =====================================================
+
+    def import_files(self):
+        if self.img is None:
+            return
+
+        paths = filedialog.askopenfilenames(
+            title="Import files", parent=self)
+        if not paths:
+            return
+
+        count = 0
+        for host in paths:
+            if not os.path.isfile(host):
+                continue
+            with open(host, "rb") as f:
+                data = f.read()
+
+            name = os.path.basename(host)
+            full = (self.current_path.rstrip("/") + "/" + name) \
+                   if self.current_path != "/" else "/" + name
+
+            try:
+                self.img.write_file(full, data)
+                count += 1
+            except Exception as e:
+                messagebox.showerror("Import failed",
+                                     f"{host}\n{e}", parent=self)
+
+        self.refresh()
+        self.status_left.set(f"Imported {count} file(s)")
+
+    def export_selected(self):
+        if self.img is None:
+            return
+
+        sel = self.tree.selection()
+        files = [iid[5:] for iid in sel if iid.startswith("file:")]
+
+        if not files:
+            return
+
+        if len(files) == 1:
+            name = files[0]
+            full = (self.current_path.rstrip("/") + "/" + name) \
+                   if self.current_path != "/" else "/" + name
+            data = self.img.read_file(full)
+            if data is None:
+                return
+
+            out = filedialog.asksaveasfilename(
+                title="Export file", initialfile=name, parent=self)
+            if not out:
+                return
+
+            with open(out, "wb") as f:
+                f.write(data)
+            self.status_left.set(f"Exported {name} → {out}")
+            return
+
+        outdir = filedialog.askdirectory(
+            title="Export files to folder", parent=self)
+        if not outdir:
+            return
+
+        for name in files:
+            full = (self.current_path.rstrip("/") + "/" + name) \
+                   if self.current_path != "/" else "/" + name
+            data = self.img.read_file(full)
+            if data is None:
+                continue
+            with open(os.path.join(outdir, name), "wb") as f:
+                f.write(data)
+
+        self.status_left.set(f"Exported {len(files)} file(s)")
+
+    # =====================================================
+    # Drag and drop
+    # =====================================================
+
+    def on_drop(self, event):
+        if self.img is None:
+            self.status_left.set("Load an image first.")
+            return
+
+        raw = event.data
+        paths = []
+        buf = ""
+        in_brace = False
+
+        for ch in raw:
+            if ch == "{":
+                in_brace = True
+                buf = ""
+            elif ch == "}":
+                in_brace = False
+                if buf:
+                    paths.append(buf)
+                buf = ""
+            elif ch == " " and not in_brace:
+                if buf:
+                    paths.append(buf)
+                    buf = ""
+            else:
+                buf += ch
+
+        if buf:
+            paths.append(buf)
+
+        paths = [p for p in paths if os.path.isfile(p)]
+        if not paths:
+            return
+
+        count = 0
+        for host in paths:
+            with open(host, "rb") as f:
+                data = f.read()
+
+            name = os.path.basename(host)
+            full = (self.current_path.rstrip("/") + "/" + name) \
+                   if self.current_path != "/" else "/" + name
+
+            try:
+                self.img.write_file(full, data)
+                count += 1
+            except Exception:
+                pass
+
+        self.refresh()
+        self.status_left.set(f"Dropped {count} file(s)")
+
+    # =====================================================
+    # Sorting / misc
+    # =====================================================
+
+    def sort_by(self, col):
+        if self.sort_col == col:
+            self.sort_rev = not self.sort_rev
+        else:
+            self.sort_col = col
+            self.sort_rev = False
+        self.refresh()
 
     def about(self):
         messagebox.showinfo(
             "About",
-            "FAT32 Disk Builder\n\n"
-            "Build a FAT32 .img with files and folders.\n"
-            "Save it as data.img and attach it to QEMU as a second disk.",
+            "FAT32 Explorer\n\n"
+            "Browse and edit FAT32 disk images.\n"
+            f"Drag-and-drop: "
+            f"{'enabled' if HAVE_DND else 'not available'}",
             parent=self)
 
 

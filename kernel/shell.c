@@ -26,6 +26,8 @@ static int shell_line_len = 0;
 
 static int shell_ui_taken_over = 0;
 
+static char fat_cwd[FAT32_MAX_NAME] = "/";
+
 
 static void print_uptime(int argc, char **argv);
 static void cmd_beep(int argc, char **argv);
@@ -958,15 +960,76 @@ static void fat_normalize_path(const char *in, char *out, int max)
     }
 }
 
+/* Resolve `name` against `fat_cwd`. Handles:
+ *   "system"        -> /system
+ *   "/system"       -> /system
+ *   ".."            -> parent of fat_cwd
+ *   "../config"     -> sibling of fat_cwd
+ *   "."             -> fat_cwd
+ */
+static void fat_resolve(const char *name, char *out, int max)
+{
+    char tmp[FAT32_MAX_NAME * 2];
+    int n = 0;
+
+    if (name[0] == '/') {
+        /* Absolute */
+        while (name[n] && n < (int)sizeof(tmp) - 1) {
+            tmp[n] = name[n];
+            n++;
+        }
+    } else {
+        /* Relative — prepend fat_cwd + "/" */
+        int b = 0;
+        while (fat_cwd[b] && n < (int)sizeof(tmp) - 1)
+            tmp[n++] = fat_cwd[b++];
+
+        if (n > 0 && tmp[n - 1] != '/' && n < (int)sizeof(tmp) - 1)
+            tmp[n++] = '/';
+
+        int k = 0;
+        while (name[k] && n < (int)sizeof(tmp) - 1)
+            tmp[n++] = name[k++];
+    }
+    tmp[n] = '\0';
+
+    /* Collapse //, resolve . and .. */
+    char *parts[32];
+    int   nparts = 0;
+
+    int i = 0;
+    while (tmp[i]) {
+        while (tmp[i] == '/') i++;
+        if (!tmp[i]) break;
+
+        char *start = &tmp[i];
+        while (tmp[i] && tmp[i] != '/') i++;
+        if (tmp[i]) tmp[i++] = '\0';
+
+        if (streq(start, "."))  continue;
+        if (streq(start, "..")) { if (nparts > 0) nparts--; continue; }
+        if (nparts < 32) parts[nparts++] = start;
+    }
+
+    int o = 0;
+    if (o < max - 1) out[o++] = '/';
+    for (int k = 0; k < nparts; k++) {
+        const char *s = parts[k];
+        while (*s && o < max - 1) out[o++] = *s++;
+        if (k + 1 < nparts && o < max - 1) out[o++] = '/';
+    }
+    out[o] = '\0';
+}
+
 static void cmd_fatls(int argc, char **argv)
 {
     if (argc < 2) {
-        fat32_list_dir("/");
+        fat32_list_dir(fat_cwd);
         return;
     }
 
     char path[FAT32_MAX_NAME];
-    fat_normalize_path(argv[1], path, FAT32_MAX_NAME);
+    fat_resolve(argv[1], path, FAT32_MAX_NAME);
     fat32_list_dir(path);
 }
 
@@ -978,7 +1041,7 @@ static void cmd_fatcat(int argc, char **argv)
     }
 
     char path[FAT32_MAX_NAME];
-    fat_normalize_path(argv[1], path, FAT32_MAX_NAME);
+    fat_resolve(argv[1], path, FAT32_MAX_NAME);
 
     static char buf[64 * 1024];
 
@@ -1032,7 +1095,7 @@ static void cmd_fatecho(int argc, char **argv)
         buf[n++] = '\n';
 
     char path[FAT32_MAX_NAME];
-    fat_normalize_path(argv[redir + 1], path, FAT32_MAX_NAME);
+    fat_resolve(argv[redir + 1], path, FAT32_MAX_NAME);
 
     int written = fat32_write_file(path, buf, n);
     if (written < 0) {
@@ -1045,6 +1108,66 @@ static void cmd_fatecho(int argc, char **argv)
     print(" bytes to ");
     print(path);
     printc('\n');
+}
+
+static void cmd_fatcd(int argc, char **argv)
+{
+    if (argc < 2) {
+        print(fat_cwd);
+        printc('\n');
+        return;
+    }
+
+    char path[FAT32_MAX_NAME];
+    fat_resolve(argv[1], path, FAT32_MAX_NAME);
+
+    if (!fat32_is_dir(path)) {
+        print("fatcd: no such directory: ");
+        print(argv[1]);
+        printc('\n');
+        return;
+    }
+
+    int i = 0;
+    while (path[i] && i < FAT32_MAX_NAME - 1) {
+        fat_cwd[i] = path[i];
+        i++;
+    }
+    fat_cwd[i] = '\0';
+}
+
+static void cmd_fatrm(int argc, char **argv)
+{
+    if (argc < 2) {
+        print("usage: fatrm <file>\n");
+        return;
+    }
+
+    char path[FAT32_MAX_NAME];
+    fat_resolve(argv[1], path, FAT32_MAX_NAME);
+
+    if (fat32_delete_file(path) < 0) {
+        print("fatrm: failed: ");
+        print(argv[1]);
+        printc('\n');
+    }
+}
+
+static void cmd_fatmkdir(int argc, char **argv)
+{
+    if (argc < 2) {
+        print("usage: fatmkdir <dir>\n");
+        return;
+    }
+
+    char path[FAT32_MAX_NAME];
+    fat_resolve(argv[1], path, FAT32_MAX_NAME);
+
+    if (fat32_mkdir(path) < 0) {
+        print("fatmkdir: failed: ");
+        print(argv[1]);
+        printc('\n');
+    }
 }
 
 /* ---------- command table ---------- */
@@ -1078,9 +1201,12 @@ static const struct command commands[] = {
     { "version",  cmd_version,   "kernel version" },
     { "wss",      cmd_wss,       "run a .wss script" },
     { "fatls", cmd_fatls, "list FAT32 root" },
-    { "fatls", cmd_fatls, "list FAT32 directory" },
-    { "fatcat", cmd_fatcat, "print FAT32 file" },
-    { "fatecho", cmd_fatecho, "write text to a FAT32 file" },
+    { "fatcd",     cmd_fatcd,     "change FAT32 directory" },
+    { "fatls",     cmd_fatls,     "list FAT32 directory" },
+    { "fatcat",    cmd_fatcat,    "print FAT32 file" },
+    { "fatecho",   cmd_fatecho,   "write text to a FAT32 file" },
+    { "fatrm",     cmd_fatrm,     "delete a FAT32 file" },
+    { "fatmkdir",  cmd_fatmkdir,  "create a FAT32 directory" },
     { NULL, NULL, NULL },
 };
 

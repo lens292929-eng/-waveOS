@@ -926,3 +926,151 @@ int fat32_write_file(const char *path, const char *buf, int len)
 
     return len;
 }
+
+int fat32_delete_file(const char *path)
+{
+    if (!fat32_ready()) return -1;
+    if (path[0] != '/') return -1;
+
+    char dir_path[FAT32_MAX_NAME];
+    char name[FAT32_MAX_NAME];
+
+    if (split_path(path, dir_path, name) < 0)
+        return -1;
+
+    int dir_cluster = resolve_dir(dir_path);
+    if (dir_cluster < 0)
+        return -1;
+
+    u32 lba, off;
+    if (find_dir_entry((u32)dir_cluster, name, &lba, &off) < 0)
+        return -1;
+
+    /* sector_buf now holds the sector containing the entry */
+    fat32_dir_entry_t *e = (fat32_dir_entry_t *)(sector_buf + off);
+
+    /* Refuse to delete a directory */
+    if (e->attr & FAT32_ATTR_DIRECTORY)
+        return -1;
+
+    u32 first = ((u32)e->first_cluster_hi << 16) | e->first_cluster_lo;
+
+    /* Free the chain. */
+    if (first >= 2)
+        free_chain(first);
+
+    /* Mark entry as deleted. */
+    e->name[0] = 0xE5;
+    if (write_sector(lba, sector_buf) < 0)
+        return -1;
+
+    return 0;
+}
+
+/* Write a directory entry with an explicit attribute. */
+static int write_dir_entry(u32 parent_cluster, const char *name,
+                           u8 attr, u32 first_cluster)
+{
+    char upper[12];
+    for (int i = 0; i < 11; i++) upper[i] = ' ';
+
+    int n = 0, dot = -1;
+    while (name[n]) { if (name[n] == '.') dot = n; n++; }
+
+    for (int i = 0; i < n; i++) {
+        char c = name[i];
+        if (c == '.') continue;
+        if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+
+        int idx = (dot >= 0 && i > dot) ? 8 + (i - dot - 1) : i;
+        if (idx < 11) upper[idx] = c;
+    }
+
+    u32 lba, off;
+    if (alloc_dir_slot(parent_cluster, &lba, &off) < 0)
+        return -1;
+
+    if (read_sector(lba, sector_buf) < 0)
+        return -1;
+
+    fat32_dir_entry_t *e = (fat32_dir_entry_t *)(sector_buf + off);
+
+    for (int i = 0; i < 11; i++) e->name[i] = (u8)upper[i];
+    e->attr = attr;
+    e->nt_reserved = 0;
+    e->create_tenths = 0;
+    e->create_time = 0;
+    e->create_date = 0;
+    e->access_date = 0;
+    e->first_cluster_hi = (u16)(first_cluster >> 16);
+    e->write_time = 0;
+    e->write_date = 0;
+    e->first_cluster_lo = (u16)(first_cluster & 0xFFFF);
+    e->size = 0;
+
+    return write_sector(lba, sector_buf);
+}
+
+int fat32_mkdir(const char *path)
+{
+    if (!fat32_ready()) return -1;
+    if (path[0] != '/') return -1;
+
+    char dir_path[FAT32_MAX_NAME];
+    char name[FAT32_MAX_NAME];
+
+    if (split_path(path, dir_path, name) < 0)
+        return -1;
+
+    if (name[0] == '\0')
+        return -1;
+
+    int parent = resolve_dir(dir_path);
+    if (parent < 0)
+        return -1;
+
+    /* Already exists? */
+    u32 dummy_lba, dummy_off;
+    if (find_dir_entry((u32)parent, name, &dummy_lba, &dummy_off) == 0)
+        return -1;
+
+    /* Allocate a cluster for the new directory. */
+    u32 new_c = fat_alloc_cluster();
+    if (new_c == 0)
+        return -1;
+
+    /* Zero the cluster. */
+    for (u32 i = 0; i < fat_cluster_size; i++)
+        cluster_buf[i] = 0;
+
+    /* Build "." and ".." entries. */
+    fat32_dir_entry_t *dot = (fat32_dir_entry_t *)cluster_buf;
+
+    for (int i = 0; i < 11; i++) dot[0].name[i] = ' ';
+    dot[0].name[0] = '.';
+    dot[0].attr = FAT32_ATTR_DIRECTORY;
+    dot[0].first_cluster_lo = (u16)(new_c & 0xFFFF);
+    dot[0].first_cluster_hi = (u16)(new_c >> 16);
+
+    for (int i = 0; i < 11; i++) dot[1].name[i] = ' ';
+    dot[1].name[0] = '.';
+    dot[1].name[1] = '.';
+    dot[1].attr = FAT32_ATTR_DIRECTORY;
+
+    /* ".." points to parent. If parent is root, cluster 0
+     * convention is used (means "the root"). */
+    u32 parent_cluster = (parent == (int)fat_root_cluster) ? 0
+                                                           : (u32)parent;
+    dot[1].first_cluster_lo = (u16)(parent_cluster & 0xFFFF);
+    dot[1].first_cluster_hi = (u16)(parent_cluster >> 16);
+
+    if (write_cluster(new_c, cluster_buf) < 0)
+        return -1;
+
+    /* Write the entry in the parent. */
+    if (write_dir_entry((u32)parent, name,
+                        FAT32_ATTR_DIRECTORY, new_c) < 0)
+        return -1;
+
+    return 0;
+}

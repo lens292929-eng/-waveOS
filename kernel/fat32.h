@@ -86,4 +86,8 @@ int  fat32_exists(const char *path);
 
 int fat32_write_file(const char *path, const char *buf, int len);
 
+int fat32_delete_file(const char *path);
+
+int fat32_mkdir(const char *path);
+
 #endif
