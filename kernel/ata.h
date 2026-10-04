@@ -11,5 +11,7 @@ int ata_read_sector(u32 lba, u8 *buf);
 
 /* Write one 512-byte sector from buf. Returns 0 on success, -1 on error. */
 int ata_write_sector(u32 lba, const u8 *buf);
+int ata_read_sector_drive(int drive, u32 lba, u8 *buf);
+int ata_write_sector_drive(int drive, u32 lba, const u8 *buf);
 
 #endif

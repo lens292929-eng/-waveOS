@@ -5,6 +5,7 @@
 #include "ramdisk.h"
 #include "shell.h"
 #include "pit.h"
+#include "colors.h"
 
 static char editor_filename[32] = "";   /* current file, empty = unnamed */
 static int  editor_dirty = 0;           /* unsaved changes */
@@ -82,6 +83,11 @@ static const char *suggest_wss[] = {
     0
 };
 
+
+int editor_is_active(void)
+{
+    return editor_active;
+}
 
 /* --------------------------------------------------------- */
 /* Helpers                                                   */
@@ -729,9 +735,9 @@ static void edit_close(void)
 
     keyboard_set_handler(shell_keyboard_handler);
 
-    framebuffer_clear(0x00000000);
+    framebuffer_clear(COLOR_WAVE_BG);
 
-    print_set_colors(0x00FFFFFF, 0x00000000);
+    print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
 
     shell_prompt();
 }

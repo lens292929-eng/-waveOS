@@ -113,6 +113,14 @@ echo Compiling desktop (c)...
 clang %KFLAGS% -c kernel\desktop.c -o build\desktop.o
 if errorlevel 1 goto :error
 
+echo Compiling mtrr (c)...
+clang %KFLAGS% -c kernel\mtrr.c -o build\mtrr.o
+if errorlevel 1 goto :error
+
+echo Compiling fat32 (c)...
+clang %KFLAGS% -c kernel\fat32.c -o build\fat32.o
+if errorlevel 1 goto :error
+
 
 REM ============================================================
 echo [4/6] Linking kernel...
@@ -140,7 +148,9 @@ ld.lld ^
     build\ata.o ^
     build\mouse.o ^
     build\cursor.o ^
-    build\desktop.o
+    build\desktop.o ^
+    build\mtrr.o ^
+    build\fat32.o
 
 if errorlevel 1 goto :error
 

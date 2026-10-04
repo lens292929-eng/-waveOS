@@ -29,8 +29,10 @@
 #define ATA_CMD_READ    0x20
 #define ATA_CMD_WRITE   0x30
 #define ATA_CMD_IDENT   0xEC
+#define ATA_CMD_FLUSH   0xE7
 
-static int ata_present = 0;
+/* Track which drives are present: 0 = master, 1 = slave. */
+static int ata_present[2] = {0, 0};
 
 /* Wait 400ns by reading the status port four times. */
 static void ata_delay400(void)
@@ -64,13 +66,16 @@ static int ata_wait_drq(void)
     return -1;
 }
 
-void ata_init(void)
+/* Send IDENTIFY to a drive. Returns 1 if present, 0 if not. */
+static int ata_identify(int drive)
 {
-    /* Select master drive, LBA mode. */
-    outb(ATA_DRIVE, 0xA0);
+    u8 drive_select = (drive == 0) ? 0xA0 : 0xB0;   /* IDENTIFY is always CHS */
+
+    /* Select the drive. */
+    outb(ATA_DRIVE, drive_select);
     ata_delay400();
 
-    /* Zero out the sector-count and LBA registers. */
+    /* Zero out the sector count and LBA registers. */
     outb(ATA_SECCOUNT, 0);
     outb(ATA_LBA_LOW,  0);
     outb(ATA_LBA_MID,  0);
@@ -78,39 +83,26 @@ void ata_init(void)
 
     /* Send IDENTIFY. */
     outb(ATA_COMMAND, ATA_CMD_IDENT);
-
     ata_delay400();
 
     /* If status is 0, no drive. */
     u8 status = inb(ATA_STATUS);
-    if (status == 0) {
-        print("[ata] no drive\n");
-        ata_present = 0;
-        return;
-    }
+    if (status == 0)
+        return 0;
 
     /* Wait for BSY to clear. */
-    if (ata_wait_not_busy() < 0) {
-        print("[ata] timeout\n");
-        ata_present = 0;
-        return;
-    }
+    if (ata_wait_not_busy() < 0)
+        return 0;
 
     /* If LBA_MID or LBA_HIGH are non-zero, it's not an ATA drive. */
-    if (inb(ATA_LBA_MID) != 0 || inb(ATA_LBA_HIGH) != 0) {
-        print("[ata] not ATA\n");
-        ata_present = 0;
-        return;
-    }
+    if (inb(ATA_LBA_MID) != 0 || inb(ATA_LBA_HIGH) != 0)
+        return 0;
 
     /* Wait for DRQ or ERR. */
     for (u32 i = 0; i < 1000000; i++) {
         status = inb(ATA_STATUS);
-        if (status & ATA_SR_ERR) {
-            print("[ata] identify failed\n");
-            ata_present = 0;
-            return;
-        }
+        if (status & ATA_SR_ERR)
+            return 0;
         if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRQ))
             break;
     }
@@ -119,18 +111,36 @@ void ata_init(void)
     for (int i = 0; i < 256; i++)
         (void)inw(ATA_DATA);
 
-    ata_present = 1;
-    print("[ata] primary master detected\n");
+    return 1;
 }
 
-int ata_read_sector(u32 lba, u8 *buf)
+void ata_init(void)
 {
-    if (!ata_present) return -1;
+    ata_present[0] = ata_identify(0);
+    ata_present[1] = ata_identify(1);
 
-    if (ata_wait_not_busy() < 0) return -1;
+    if (ata_present[0])
+        print("[ata] primary master detected\n");
+    if (ata_present[1])
+        print("[ata] primary slave detected\n");
 
-    /* Select master, LBA mode, top 4 bits of LBA in the low nibble. */
-    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    if (!ata_present[0] && !ata_present[1])
+        print("[ata] no drives detected\n");
+}
+
+int ata_read_sector_drive(int drive, u32 lba, u8 *buf)
+{
+    if (drive < 0 || drive > 1) return -1;
+    if (!ata_present[drive])    return -1;
+
+    u8 drive_select = (drive == 0) ? 0xE0 : 0xF0;
+
+    if (ata_wait_not_busy() < 0) {
+        print("[ata] read: BSY stuck before select\n");
+        return -1;
+    }
+
+    outb(ATA_DRIVE, drive_select | ((lba >> 24) & 0x0F));
     ata_delay400();
 
     outb(ATA_SECCOUNT, 1);
@@ -139,28 +149,40 @@ int ata_read_sector(u32 lba, u8 *buf)
     outb(ATA_LBA_HIGH, (u8)((lba >> 16) & 0xFF));
 
     outb(ATA_COMMAND, ATA_CMD_READ);
-
     ata_delay400();
 
-    if (ata_wait_drq() < 0) return -1;
+    if (ata_wait_drq() < 0) {
+        u8 st  = inb(ATA_STATUS);
+        u8 err = inb(ATA_ERROR);
 
-    /* Read 256 words = 512 bytes. */
+        print("[ata] read failed: status=");
+        printc("0123456789ABCDEF"[(st >> 4) & 0xF]);
+        printc("0123456789ABCDEF"[st & 0xF]);
+        print(" error=");
+        printc("0123456789ABCDEF"[(err >> 4) & 0xF]);
+        printc("0123456789ABCDEF"[err & 0xF]);
+        print("\n");
+        return -1;
+    }
+
     u16 *p = (u16 *)buf;
     for (int i = 0; i < 256; i++)
         p[i] = inw(ATA_DATA);
 
     ata_delay400();
-
     return 0;
 }
 
-int ata_write_sector(u32 lba, const u8 *buf)
+int ata_write_sector_drive(int drive, u32 lba, const u8 *buf)
 {
-    if (!ata_present) return -1;
+    if (drive < 0 || drive > 1) return -1;
+    if (!ata_present[drive])    return -1;
+
+    u8 drive_select = (drive == 0) ? 0xE0 : 0xF0;
 
     if (ata_wait_not_busy() < 0) return -1;
 
-    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(ATA_DRIVE, drive_select | ((lba >> 24) & 0x0F));
     ata_delay400();
 
     outb(ATA_SECCOUNT, 1);
@@ -169,7 +191,6 @@ int ata_write_sector(u32 lba, const u8 *buf)
     outb(ATA_LBA_HIGH, (u8)((lba >> 16) & 0xFF));
 
     outb(ATA_COMMAND, ATA_CMD_WRITE);
-
     ata_delay400();
 
     if (ata_wait_drq() < 0) return -1;
@@ -179,10 +200,20 @@ int ata_write_sector(u32 lba, const u8 *buf)
         outw(ATA_DATA, p[i]);
 
     /* Flush the write cache. */
-    outb(ATA_COMMAND, 0xE7);
+    outb(ATA_COMMAND, ATA_CMD_FLUSH);
     ata_delay400();
 
     if (ata_wait_not_busy() < 0) return -1;
 
     return 0;
+}
+
+int ata_read_sector(u32 lba, u8 *buf)
+{
+    return ata_read_sector_drive(0, lba, buf);
+}
+
+int ata_write_sector(u32 lba, const u8 *buf)
+{
+    return ata_write_sector_drive(0, lba, buf);
 }

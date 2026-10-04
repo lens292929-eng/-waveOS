@@ -11,6 +11,9 @@
 #include "desktop.h"
 #include "cursor.h"
 #include "keyboard.h"
+#include "colors.h"
+#include "fat32.h"
+
 /* ---------- cwd ---------- */
 
 #define CWD_MAX 128
@@ -143,26 +146,18 @@ static int tree_is_direct_child(const char *name, const char *dir,
             return 0;
 
         const char *rel = name + 1;
-        if (*rel == '\0')
+        int rlen = strlen_simple(rel);
+        if (rlen == 0)
             return 0;
 
-        int slash_count = 0;
-        for (int i = 0; rel[i]; i++) {
+        /* Reject anything with a slash not in the last position. */
+        for (int i = 0; i < rlen - 1; i++) {
             if (rel[i] == '/')
-                slash_count++;
+                return 0;
         }
 
-        /*
-         * A directory itself ends in '/', so:
-         * /foo/       -> direct child
-         * /foo/bar    -> not direct
-         * /foo/bar/   -> not direct
-         */
-        if (slash_count > 1)
-            return 0;
-
         *child_out = rel;
-        *is_dir_out = (rel[strlen_simple(rel) - 1] == '/');
+        *is_dir_out = (rel[rlen - 1] == '/');
         return 1;
     }
 
@@ -182,29 +177,31 @@ static int tree_is_direct_child(const char *name, const char *dir,
         return 0;
 
     const char *rel = name + dir_len + 1;
-
-    if (*rel == '\0')
+    int rlen = strlen_simple(rel);
+    if (rlen == 0)
         return 0;
 
-    int slash_count = 0;
-    for (int i = 0; rel[i]; i++) {
+    for (int i = 0; i < rlen - 1; i++) {
         if (rel[i] == '/')
-            slash_count++;
+            return 0;
     }
 
-    if (slash_count > 1)
-        return 0;
-
     *child_out = rel;
-    *is_dir_out = (rel[strlen_simple(rel) - 1] == '/');
-
+    *is_dir_out = (rel[rlen - 1] == '/');
     return 1;
 }
 
 
 void shell_cursor_blink(void)
 {
-    cursor_tick();
+    if (shell_ui_taken_over)
+        return;
+
+    if (editor_is_active()) {
+        return;
+    }
+
+    cursor_blink();
 }
 
 static void tree_print_indent(int depth)
@@ -236,12 +233,12 @@ static void tree_scan_callback(const char *name, int size)
 
     if (is_dir) {
         print("|-- ");
-        print_set_colors(0x0050A0FF, 0x00000000);
+        print_set_colors(0x0050A0FF, COLOR_WAVE_BG);
 
         for (int i = 0; i < child_len - 1; i++)
             printc(child[i]);
 
-        print_set_colors(0x00FFFFFF, 0x00000000);
+        print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
         print("/\n");
 
         /* Build the full path of the directory. */
@@ -273,14 +270,14 @@ static void tree_scan_callback(const char *name, int size)
         tree_scan_depth = saved_depth;
     } else {
         print("|-- ");
-        print_set_colors(0x00FFFFFF, 0x00000000);
+        print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
         print(child);
 
-        print_set_colors(0x00808080, 0x00000000);
+        print_set_colors(0x00808080, COLOR_WAVE_BG);
         print(" (");
         print_u64((u64)size);
         print(" bytes)");
-        print_set_colors(0x00FFFFFF, 0x00000000);
+        print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
         printc('\n');
     }
 }
@@ -382,9 +379,9 @@ static void cmd_tree(int argc, char **argv)
         str_copy(target, cwd, CWD_MAX);
     }
 
-    print_set_colors(0x0050A0FF, 0x00000000);
+    print_set_colors(0x0050A0FF, COLOR_WAVE_BG);
     print(target);
-    print_set_colors(0x00FFFFFF, 0x00000000);
+    print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
     printc('\n');
 
     str_copy(tree_scan_dir, target, CWD_MAX);
@@ -392,7 +389,7 @@ static void cmd_tree(int argc, char **argv)
 
     ramdisk_list(tree_scan_callback);
 
-    print_set_colors(0x00FFFFFF, 0x00000000);
+    print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
 }
 
 static void ls_print(const char *name, int size)
@@ -420,26 +417,26 @@ static void ls_print(const char *name, int size)
         if (rel[i] == '/') return;
 
     if (is_dir) {
-        print_set_colors(0x0050A0FF, 0x00000000);
+        print_set_colors(0x0050A0FF, COLOR_WAVE_BG);
         for (int i = 0; i < rlen - 1; i++)
             printc(rel[i]);
         printc('/');
         printc('\n');
-        print_set_colors(0x00FFFFFF, 0x00000000);
+        print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
     } else {
-        print_set_colors(0x00FFFFFF, 0x00000000);
+        print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
         print(rel);
 
         int pad = 24 - rlen;
         for (int i = 0; i < pad; i++)
             printc(' ');
 
-        print_set_colors(0x00808080, 0x00000000);
+        print_set_colors(0x00808080, COLOR_WAVE_BG);
         print_u64((u64)size);
         print(" bytes");
         printc('\n');
 
-        print_set_colors(0x00FFFFFF, 0x00000000);
+        print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
     }
 }
 
@@ -580,7 +577,7 @@ static void cmd_help(int argc, char **argv);
 
 static void cmd_clear(int argc, char **argv) {
     (void)argc; (void)argv;
-    framebuffer_clear(0x00000000);
+    framebuffer_clear(COLOR_WAVE_BG);
 }
 
 static volatile int funny_cancel = 0;
@@ -947,6 +944,109 @@ static void cmd_desktop(int argc, char **argv)
     desktop_enter();
 }
 
+static void fat_normalize_path(const char *in, char *out, int max)
+{
+    if (in[0] == '/') {
+        int i = 0;
+        while (in[i] && i < max - 1) { out[i] = in[i]; i++; }
+        out[i] = '\0';
+    } else {
+        out[0] = '/';
+        int i = 0;
+        while (in[i] && i < max - 2) { out[i + 1] = in[i]; i++; }
+        out[i + 1] = '\0';
+    }
+}
+
+static void cmd_fatls(int argc, char **argv)
+{
+    if (argc < 2) {
+        fat32_list_dir("/");
+        return;
+    }
+
+    char path[FAT32_MAX_NAME];
+    fat_normalize_path(argv[1], path, FAT32_MAX_NAME);
+    fat32_list_dir(path);
+}
+
+static void cmd_fatcat(int argc, char **argv)
+{
+    if (argc < 2) {
+        print("usage: fatcat <file>\n");
+        return;
+    }
+
+    char path[FAT32_MAX_NAME];
+    fat_normalize_path(argv[1], path, FAT32_MAX_NAME);
+
+    static char buf[64 * 1024];
+
+    int n = fat32_read_file(path, buf, sizeof(buf) - 1);
+    if (n < 0) {
+        print("fatcat: not found: ");
+        print(argv[1]);
+        printc('\n');
+        return;
+    }
+
+    for (int i = 0; i < n; i++)
+        printc(buf[i]);
+
+    if (n == 0 || buf[n - 1] != '\n')
+        printc('\n');
+}
+
+static void cmd_fatecho(int argc, char **argv)
+{
+    if (argc < 3) {
+        print("usage: fatecho <text...> > <file>\n");
+        return;
+    }
+
+    /* Same redirection parsing as cmd_echo */
+    int redir = -1;
+    for (int i = 1; i < argc; i++) {
+        if (streq(argv[i], ">")) {
+            redir = i;
+            break;
+        }
+    }
+
+    if (redir < 0 || redir + 1 >= argc) {
+        print("fatecho: expected > filename\n");
+        return;
+    }
+
+    /* Build the text. */
+    char buf[RAMDISK_DATA_MAX];
+    int  n = 0;
+
+    for (int i = 1; i < redir; i++) {
+        for (const char *p = argv[i]; *p && n < RAMDISK_DATA_MAX - 1; p++)
+            buf[n++] = *p;
+        if (i + 1 < redir && n < RAMDISK_DATA_MAX - 1)
+            buf[n++] = ' ';
+    }
+    if (n < RAMDISK_DATA_MAX - 1)
+        buf[n++] = '\n';
+
+    char path[FAT32_MAX_NAME];
+    fat_normalize_path(argv[redir + 1], path, FAT32_MAX_NAME);
+
+    int written = fat32_write_file(path, buf, n);
+    if (written < 0) {
+        print("fatecho: write failed\n");
+        return;
+    }
+
+    print("wrote ");
+    print_u64((u64)written);
+    print(" bytes to ");
+    print(path);
+    printc('\n');
+}
+
 /* ---------- command table ---------- */
 
 struct command {
@@ -977,7 +1077,10 @@ static const struct command commands[] = {
     { "uptime",   print_uptime,  "shows how long the computer has been running for" },
     { "version",  cmd_version,   "kernel version" },
     { "wss",      cmd_wss,       "run a .wss script" },
-
+    { "fatls", cmd_fatls, "list FAT32 root" },
+    { "fatls", cmd_fatls, "list FAT32 directory" },
+    { "fatcat", cmd_fatcat, "print FAT32 file" },
+    { "fatecho", cmd_fatecho, "write text to a FAT32 file" },
     { NULL, NULL, NULL },
 };
 
@@ -1007,17 +1110,17 @@ static void cmd_help(int argc, char **argv) {
 /* ---------- prompt ---------- */
 
 void shell_prompt(void) {
-    print_set_colors(0x00A0A0A0, 0x00000000);
+    print_set_colors(0x00A0A0A0, COLOR_WAVE_BG);
     print("wave");
-    print_set_colors(0x00606060, 0x00000000);
+    print_set_colors(0x00606060, COLOR_WAVE_BG);
     print("@");
 
-    print_set_colors(0x00FFD070, 0x00000000);
+    print_set_colors(0x00FFD070, COLOR_WAVE_BG);
     print(cwd);
 
-    print_set_colors(0x00A0FFA0, 0x00000000);
+    print_set_colors(0x00A0FFA0, COLOR_WAVE_BG);
     print("> ");
-    print_set_colors(0x00FFFFFF, 0x00000000);
+    print_set_colors(0x00FFFFFF, COLOR_WAVE_BG);
 }
 
 /* ---------- tokenizer ---------- */

@@ -33,6 +33,7 @@
 #define COLOR_LIGHT_MAGENTA 0x00FF55FF
 #define COLOR_YELLOW        0x00FFFF55
 #define COLOR_WHITE         0x00FFFFFF
+#define COLOR_WAVE_BG       0x00101820   
 
 // Convenience aliases
 #define COLOR_GREY          COLOR_LIGHT_GRAY

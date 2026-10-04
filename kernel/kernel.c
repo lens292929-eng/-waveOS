@@ -10,10 +10,12 @@
 #include "ata.h"
 #include "wfs.h"
 #include "desktop.h"
+#include "fat32.h"
+
 
 static void show_welcome(void)
 {
-    print_set_colors(COLOR_LIGHT_CYAN, COLOR_BLACK);
+    print_set_colors(COLOR_LIGHT_CYAN, COLOR_WAVE_BG);
     print(
         "\n"
         "==========================================\n"
@@ -35,11 +37,11 @@ __attribute__((ms_abi))
 void kmain(BootInfo *boot_info)
 {
     framebuffer_init(boot_info);
-    framebuffer_clear(COLOR_BLACK);
+    framebuffer_clear(COLOR_WAVE_BG);
 
     show_welcome();
 
-    print_set_colors(COLOR_WHITE, COLOR_BLACK);
+    print_set_colors(COLOR_WHITE, COLOR_WAVE_BG);
 
     show_logs();
 
@@ -61,11 +63,33 @@ void kmain(BootInfo *boot_info)
     keyboard_init();
     print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized Keyboard\n");
 
-    mouse_init();
-    print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized Mouse\n");
+    // mouse_init();
+    // print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized Mouse\n");
 
     ata_init();
     print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized ATA\n");
+
+    u8 probe[512];
+    int probe_result = ata_read_sector_drive(1, 0, probe);
+
+    print("[probe] drive 1 read: ");
+    print_u64((u64)probe_result);
+    print("\n");
+
+    print("[probe] first bytes: ");
+    for (int i = 0; i < 8; i++) {
+        u8 b = probe[i];
+        printc("0123456789ABCDEF"[(b >> 4) & 0xF]);
+        printc("0123456789ABCDEF"[b & 0xF]);
+        printc(' ');
+    }
+    printc('\n');
+
+    if (fat32_init(1) == 0) {
+        print_tagged("OK", COLOR_LIGHT_GREEN, "Mounted FAT32 (data disk)\n");
+    } else {
+        print_tagged("!!", COLOR_LIGHT_RED, "FAT32 mount failed\n");
+    }
 
     wfs_init();
     print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized wFs\n");
@@ -86,7 +110,6 @@ void kmain(BootInfo *boot_info)
     shell_prompt();
 
     for (;;) {
-        cursor_tick();
         __asm__ volatile ("hlt");
     }
 }

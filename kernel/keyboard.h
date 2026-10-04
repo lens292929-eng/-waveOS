@@ -43,3 +43,4 @@ keyboard_handler_t keyboard_get_handler(void);
 void keyboard_pause_begin(void);
 void keyboard_pause_end(void);
 int keyboard_pause_wait(void);
+int  keyboard_editor_is_active(void);   /* <-- add this */

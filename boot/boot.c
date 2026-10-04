@@ -50,10 +50,6 @@ typedef struct {
 // UEFI input
 // ============================================================
 
-// ============================================================
-// UEFI input
-// ============================================================
-
 typedef void *EFI_EVENT;
 
 typedef struct {
@@ -655,10 +651,6 @@ static void resolution_switcher(
 
         u32 max_display = gop->Mode->MaxMode;
 
-        /*
-         * Keep the menu reasonably sized.
-         * We can expand this later with scrolling.
-         */
         u32 first_mode = 0;
 
         if (selected >= 8)
@@ -755,10 +747,6 @@ static void resolution_switcher(
 
                     refresh_framebuffer();
 
-                    /*
-                     * Redraw after GOP changes the
-                     * framebuffer address/resolution.
-                     */
                     fb_clear(BG_COLOR);
 
                     cursor_x = MARGIN_X;
@@ -800,9 +788,6 @@ static void resolution_switcher(
                     }
                 }
 
-                /*
-                 * SetMode failed.
-                 */
                 fb_clear(BG_COLOR);
 
                 cursor_x = MARGIN_X;
@@ -939,15 +924,9 @@ static void firmware_options(
 
             if (key.UnicodeChar == '\r') {
 
-                /*
-                 * Boot waveOS
-                 */
                 if (selected == 0)
                     return;
 
-                /*
-                 * System information
-                 */
                 if (selected == 1) {
 
                     fb_clear(BG_COLOR);
@@ -955,32 +934,16 @@ static void firmware_options(
                     cursor_x = MARGIN_X;
                     cursor_y = MARGIN_Y;
 
-                    boot_log(
-                        "System Information\r\n"
-                    );
-
-                    boot_log(
-                        "==================\r\n"
-                    );
-
+                    boot_log("System Information\r\n");
+                    boot_log("==================\r\n");
                     boot_log("\r\n");
 
-                    boot_log(
-                        "Firmware: waveFirmware 0.1\r\n"
-                    );
-
-                    boot_log(
-                        "Architecture: x86-64\r\n"
-                    );
-
-                    boot_log(
-                        "Boot mode: UEFI\r\n"
-                    );
+                    boot_log("Firmware: waveFirmware 0.1\r\n");
+                    boot_log("Architecture: x86-64\r\n");
+                    boot_log("Boot mode: UEFI\r\n");
 
                     boot_log("\r\n");
-                    boot_log(
-                        "Press ENTER or ESC to return.\r\n"
-                    );
+                    boot_log("Press ENTER or ESC to return.\r\n");
 
                     for (;;) {
 
@@ -1002,9 +965,6 @@ static void firmware_options(
                     break;
                 }
 
-                /*
-                 * Display information
-                 */
                 if (selected == 2) {
 
                     fb_clear(BG_COLOR);
@@ -1012,42 +972,26 @@ static void firmware_options(
                     cursor_x = MARGIN_X;
                     cursor_y = MARGIN_Y;
 
-                    boot_log(
-                        "Display Information\r\n"
-                    );
-
-                    boot_log(
-                        "===================\r\n"
-                    );
-
+                    boot_log("Display Information\r\n");
+                    boot_log("===================\r\n");
                     boot_log("\r\n");
 
                     boot_log("Resolution: ");
-
                     boot_print_u32(fb_width);
-
                     boot_log(" x ");
-
                     boot_print_u32(fb_height);
-
                     boot_log("\r\n");
 
                     boot_log("Pitch: ");
-
                     boot_print_u32(fb_pitch);
-
                     boot_log("\r\n");
 
                     boot_log("GOP modes: ");
-
                     boot_print_u32(gop->Mode->MaxMode);
-
                     boot_log("\r\n");
 
                     boot_log("\r\n");
-                    boot_log(
-                        "Press ENTER or ESC to return.\r\n"
-                    );
+                    boot_log("Press ENTER or ESC to return.\r\n");
 
                     for (;;) {
 
@@ -1069,9 +1013,6 @@ static void firmware_options(
                     break;
                 }
 
-                /*
-                 * Resolution Switcher
-                 */
                 if (selected == 3) {
 
                     resolution_switcher(ST);
@@ -1079,9 +1020,6 @@ static void firmware_options(
                     break;
                 }
 
-                /*
-                 * Boot options
-                 */
                 if (selected == 4) {
 
                     fb_clear(BG_COLOR);
@@ -1089,32 +1027,16 @@ static void firmware_options(
                     cursor_x = MARGIN_X;
                     cursor_y = MARGIN_Y;
 
-                    boot_log(
-                        "Boot Options\r\n"
-                    );
-
-                    boot_log(
-                        "============\r\n"
-                    );
-
+                    boot_log("Boot Options\r\n");
+                    boot_log("============\r\n");
                     boot_log("\r\n");
 
-                    boot_log(
-                        "Boot target: waveOS\r\n"
-                    );
-
-                    boot_log(
-                        "Kernel: \\EFI\\BOOT\\KERNEL.BIN\r\n"
-                    );
-
-                    boot_log(
-                        "Kernel address: 0x100000\r\n"
-                    );
+                    boot_log("Boot target: waveOS\r\n");
+                    boot_log("Kernel: \\EFI\\BOOT\\KERNEL.BIN\r\n");
+                    boot_log("Kernel address: 0x100000\r\n");
 
                     boot_log("\r\n");
-                    boot_log(
-                        "Press ENTER or ESC to return.\r\n"
-                    );
+                    boot_log("Press ENTER or ESC to return.\r\n");
 
                     for (;;) {
 
@@ -1176,26 +1098,14 @@ static int firmware_countdown(
         boot_log("\r\n");
         boot_log("\r\n");
 
-        boot_log(
-            "Press F8 for waveFirmware Options"
-        );
+        boot_log("Press F8 for waveFirmware Options\r\n");
+        boot_log("Press F6 to switch resolution\r\n");
 
-        /*
-         * 100 × 10ms = 1 second
-         */
         for (int i = 0; i < 100; i++) {
 
             EFI_INPUT_KEY key;
 
             if (read_key(ST, &key)) {
-
-                /*
-                 * Debug:
-                 *
-                 * If F8 is received, this will
-                 * immediately show the firmware menu.
-                 */
-
 
                 if (key.ScanCode == SCAN_F8) {
 
@@ -1208,18 +1118,9 @@ static int firmware_countdown(
 
                     resolution_switcher(ST);
 
-                    /*
-                    * Resolution may have changed, so redraw
-                    * the countdown using the new framebuffer.
-                    */
                     break;
                 }
 
-
-                /*
-                 * Some firmware/input implementations
-                 * can provide function keys differently.
-                 */
                 if (
                     key.ScanCode == 0x12 &&
                     key.UnicodeChar == 0
@@ -1257,9 +1158,6 @@ EFI_STATUS EFIAPI efi_main(
     // --------------------------------------------------------
     // 1. GOP
     // --------------------------------------------------------
-    // --------------------------------------------------------
-    // 1. GOP
-    // --------------------------------------------------------
 
     EFI_GRAPHICS_OUTPUT_PROTOCOL *GOP = 0;
 
@@ -1285,12 +1183,6 @@ EFI_STATUS EFIAPI efi_main(
         return status;
     }
 
-    /*
-    * Save the GOP globally.
-    *
-    * waveFirmware uses this before ExitBootServices()
-    * to change display modes.
-    */
     gop = GOP;
 
     fb =
@@ -1327,23 +1219,6 @@ EFI_STATUS EFIAPI efi_main(
 
     boot_log("waveOS UEFI BOOTLOADER\r\n");
     boot_log("----------------------------------------\r\n");
-
-    // --------------------------------------------------------
-    // Continue normal boot
-    // --------------------------------------------------------
-
-    fb_clear(BG_COLOR);
-
-    cursor_x = MARGIN_X;
-    cursor_y = MARGIN_Y;
-
-    boot_log(
-        "waveOS UEFI BOOTLOADER\r\n"
-    );
-
-    boot_log(
-        "----------------------------------------\r\n"
-    );
 
     // --------------------------------------------------------
     // 2. Filesystem
@@ -1432,10 +1307,6 @@ EFI_STATUS EFIAPI efi_main(
     #define KERNEL_BASE  0x100000ULL
     #define KERNEL_PAGES 512
 
-    /*
-     * 512 pages × 4096 = 2 MiB.
-     */
-
     u64 kernel_address =
         KERNEL_BASE;
 
@@ -1486,12 +1357,6 @@ EFI_STATUS EFIAPI efi_main(
         "[ OK ] KERNEL LOADED AT 0x100000\r\n"
     );
 
-    /*
-     * Zero the remaining kernel allocation.
-     *
-     * This gives the kernel a clean region for .bss.
-     */
-
     u8 *kbase =
         (u8 *)(usize)kernel_address;
 
@@ -1504,7 +1369,7 @@ EFI_STATUS EFIAPI efi_main(
     }
 
     // --------------------------------------------------------
-    // 5. Memory map for kernel
+    // 5. Allocate memory map buffer
     // --------------------------------------------------------
 
     usize map_size = 0;
@@ -1521,9 +1386,7 @@ EFI_STATUS EFIAPI efi_main(
             &desc_ver
         );
 
-    if (
-        status != EFI_BUFFER_TOO_SMALL
-    ) {
+    if (status != EFI_BUFFER_TOO_SMALL) {
 
         boot_log(
             "ERROR: MEMORY MAP QUERY FAILED\r\n"
@@ -1532,13 +1395,7 @@ EFI_STATUS EFIAPI efi_main(
         return status;
     }
 
-    /*
-     * Extra room because allocating the
-     * memory-map buffer changes the map.
-     */
-
-    map_size +=
-        desc_size * 8;
+    map_size += desc_size * 8;
 
     u64 map_address = 0;
 
@@ -1560,6 +1417,10 @@ EFI_STATUS EFIAPI efi_main(
         return status;
     }
 
+    // --------------------------------------------------------
+    // 6. Get FINAL memory map
+    // --------------------------------------------------------
+
     status =
         BS->GetMemoryMap(
             &map_size,
@@ -1580,39 +1441,21 @@ EFI_STATUS EFIAPI efi_main(
     }
 
     // --------------------------------------------------------
-    // 6. Fill BootInfo
+    // 7. Fill BootInfo
     // --------------------------------------------------------
 
-    boot_info.framebuffer =
-        (u64)(usize)fb;
+    boot_info.framebuffer = (u64)(usize)fb;
+    boot_info.width       = fb_width;
+    boot_info.height      = fb_height;
+    boot_info.pitch       = fb_pitch;
+    boot_info.pad         = 0;
 
-    boot_info.width =
-        fb_width;
-
-    boot_info.height =
-        fb_height;
-
-    boot_info.pitch =
-        fb_pitch;
-
-    boot_info.pad =
-        0;
-
-    boot_info.memory_map =
-        map_address;
-
-    boot_info.memory_map_size =
-        map_size;
-
-    boot_info.memory_descriptor_size =
-        desc_size;
-
-    boot_log(
-        "[ OK ] EXITING BOOT SERVICES\r\n"
-    );
+    boot_info.memory_map             = map_address;
+    boot_info.memory_map_size        = map_size;
+    boot_info.memory_descriptor_size = desc_size;
 
     // --------------------------------------------------------
-    // 7. Exit boot services
+    // 8. Exit boot services
     // --------------------------------------------------------
 
     status =
@@ -1621,17 +1464,47 @@ EFI_STATUS EFIAPI efi_main(
             map_key
         );
 
-    if (status != EFI_SUCCESS) {
+    if (status == 0x8000000000000002ULL) {
+        /*
+         * EFI_INVALID_PARAMETER — the map changed.
+         * Re-fetch and retry.
+         */
 
-        boot_log(
-            "ERROR: EXITBOOTSERVICES FAILED\r\n"
-        );
+        map_size =
+            ((map_size + 4095) / 4096) * 4096;
+
+        status =
+            BS->GetMemoryMap(
+                &map_size,
+                (void *)(usize)map_address,
+                &map_key,
+                &desc_size,
+                &desc_ver
+            );
+
+        if (status != EFI_SUCCESS) {
+
+            return status;
+        }
+
+        boot_info.memory_map             = map_address;
+        boot_info.memory_map_size        = map_size;
+        boot_info.memory_descriptor_size = desc_size;
+
+        status =
+            BS->ExitBootServices(
+                ImageHandle,
+                map_key
+            );
+    }
+
+    if (status != EFI_SUCCESS) {
 
         return status;
     }
 
     // --------------------------------------------------------
-    // 8. Jump to kernel
+    // 9. Jump to kernel
     // --------------------------------------------------------
 
     typedef void (EFIAPI *KernelEntry)(

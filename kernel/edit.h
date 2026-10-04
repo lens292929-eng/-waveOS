@@ -17,5 +17,6 @@
 void launch_edit(void);
 void edit_handle_key(int key);
 void edit_open(const char *name);
+int editor_is_active(void);
 
 #endif
