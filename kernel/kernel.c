@@ -11,6 +11,9 @@
 #include "wfs.h"
 #include "desktop.h"
 #include "fat32.h"
+#include "fatimg.h"
+#include "font_ttf.h"
+#include "types.h"
 
 
 static void show_welcome(void)
@@ -63,8 +66,8 @@ void kmain(BootInfo *boot_info)
     keyboard_init();
     print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized Keyboard\n");
 
-    // mouse_init();
-    // print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized Mouse\n");
+    mouse_init();
+    print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized Mouse\n");
 
     ata_init();
     print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized ATA\n");
@@ -110,6 +113,13 @@ void kmain(BootInfo *boot_info)
     shell_prompt();
 
     for (;;) {
+            if (shell_wants_desktop()) {
+                shell_set_desktop_active(1);
+                desktop_enter();
+                shell_set_desktop_active(0);
+                framebuffer_clear(COLOR_WAVE_BG);
+                shell_prompt();
+            }
         __asm__ volatile ("hlt");
     }
 }

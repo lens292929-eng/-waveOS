@@ -9,7 +9,7 @@ if not exist build mkdir build
 
 set CLANG_FLAGS=-ffreestanding -fno-builtin -fno-stack-protector ^
     -mno-red-zone -mno-sse -mno-sse2 -mno-mmx ^
-    -Wall -Wextra
+    -Wall -Wextra -I kernel
 
 REM ============================================================
 echo.
@@ -121,6 +121,25 @@ echo Compiling fat32 (c)...
 clang %KFLAGS% -c kernel\fat32.c -o build\fat32.o
 if errorlevel 1 goto :error
 
+echo compiling fatimg (c)...
+clang %KFLAGS% -c kernel\fatimg.c -o build\fatimg.o
+if errorlevel 1 goto :error
+
+echo compiling print_ttf (c)...
+clang %KFLAGS% -c kernel\print_ttf.c -o build\print_ttf.o
+if errorlevel 1 goto :error
+
+set STB_FLAGS=--target=x86_64-unknown-elf -ffreestanding -fno-builtin ^
+    -fno-stack-protector -mno-red-zone -Wall -Wextra ^
+    -mcmodel=kernel -O2 -fno-pic -fno-pie ^
+    -msse -msse2 -mfpmath=sse -I kernel
+
+clang %STB_FLAGS% -fno-strict-aliasing -c kernel\stb_shims.c -o build\stb_shims.o
+if errorlevel 1 goto :error
+clang %STB_FLAGS% -fno-strict-aliasing -c kernel\stb_impl.c  -o build\stb_impl.o
+if errorlevel 1 goto :error
+clang %STB_FLAGS% -fno-strict-aliasing -c kernel\font_ttf.c  -o build\font_ttf.o
+if errorlevel 1 goto :error
 
 REM ============================================================
 echo [4/6] Linking kernel...
@@ -150,7 +169,12 @@ ld.lld ^
     build\cursor.o ^
     build\desktop.o ^
     build\mtrr.o ^
-    build\fat32.o
+    build\fat32.o ^
+    build\fatimg.o ^
+    build\stb_shims.o ^
+    build\stb_impl.o ^
+    build\font_ttf.o ^
+    build\print_ttf.o
 
 if errorlevel 1 goto :error
 

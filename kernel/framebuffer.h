@@ -78,4 +78,7 @@ u32 framebuffer_get_width(void);
 
 u32 framebuffer_get_height(void);
 
+void text_draw_char(char c, u32 x, u32 y, u32 fg, u32 bg);
+void text_draw_string(const char *s, u32 x, u32 y, u32 fg, u32 bg);
+
 #endif

@@ -1,6 +1,7 @@
 #include "keyboard.h"
 #include "io.h"
 #include "edit.h"
+#include "shell.h"
 
 /* --------------------------------------------------------- */
 /* Keyboard handler                                          */
@@ -307,6 +308,12 @@ void keyboard_handle_scancode(u8 sc)
     if (kb_pause_mode) {
         if (sc == 0x1C)
             kb_pause_done = 1;
+        return;
+    }
+
+    if (shell_is_desktop_active()) {
+        if (sc == 0x01)                    /* Escape make */
+            shell_request_desktop_exit();
         return;
     }
 

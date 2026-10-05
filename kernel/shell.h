@@ -12,5 +12,10 @@ void shell_init(void);
 void shell_shutdown(void);
 void shell_cursor_blink(void);
 void shell_keyboard_handler(const keyboard_event_t *event);
+int shell_wants_desktop(void);
+void shell_set_desktop_active(int active);
+int  shell_is_desktop_active(void);
+void shell_request_desktop_exit(void);
+int  shell_desktop_should_exit(void);
 
 #endif

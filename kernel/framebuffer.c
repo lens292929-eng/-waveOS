@@ -1,6 +1,8 @@
 #include "framebuffer.h"
 #include "seabios_font.h"
 #include "mtrr.h"
+#include "font_ttf.h"
+#include "shell.h"
 
 #define FONT_WIDTH   8
 #define FONT_HEIGHT  16
@@ -144,6 +146,25 @@ void framebuffer_draw_char(char c, u32 x, u32 y,
     }
 }
 
+void text_draw_char(char c, u32 x, u32 y, u32 fg, u32 bg)
+{
+    if (font_ttf_ready()) {
+        font_ttf_draw_char(c, x, y, fg, bg);
+        return;
+    }
+
+    framebuffer_draw_char(c, x, y, fg, bg);
+}
+
+void text_draw_string(const char *s, u32 x, u32 y, u32 fg, u32 bg)
+{
+    while (*s) {
+        text_draw_char(*s, x, y, fg, bg);
+        x += 8;   /* bitmap width; TTF advance varies */
+        s++;
+    }
+}
+
 
 // ============================================================
 // Scroll
@@ -222,6 +243,9 @@ void cursor_hide(void)
 
 void cursor_blink(void)
 {
+    if (shell_is_desktop_active())
+        return;
+
     if (cursor_visible)
         cursor_hide();
     else

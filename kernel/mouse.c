@@ -67,16 +67,7 @@ static u8 mouse_read(void)
     return inb(0x60);
 }
 
-/* --- init --- */
 
-void mouse_set_bounds(int w, int h)
-{
-    bounds_w = w;
-    bounds_h = h;
-
-    if (mouse_x >= w) mouse_x = w - 1;
-    if (mouse_y >= h) mouse_y = h - 1;
-}
 
 void mouse_init(void)
 {
@@ -111,6 +102,12 @@ void mouse_init(void)
 
     packet_index = 0;
     buttons = 0;
+
+    bounds_w = (int)framebuffer_get_width();
+    bounds_h = (int)framebuffer_get_height();
+
+    mouse_x = bounds_w / 2;
+    mouse_y = bounds_h / 2;
 }
 
 /* --- packet handling --- */

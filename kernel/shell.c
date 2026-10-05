@@ -13,6 +13,9 @@
 #include "keyboard.h"
 #include "colors.h"
 #include "fat32.h"
+#include "fatimg.h"
+#include "font_ttf.h"
+#include "print_ttf.h"
 
 /* ---------- cwd ---------- */
 
@@ -20,6 +23,7 @@
 static char cwd[CWD_MAX] = "/";
 
 #define SHELL_LINE_MAX 256
+static volatile int desktop_active = 0;
 
 static char shell_line[SHELL_LINE_MAX];
 static int shell_line_len = 0;
@@ -329,6 +333,9 @@ void shell_keyboard_handler(const keyboard_event_t *event)
         return;
     }
 
+    if (desktop_active)
+        return;
+        
     /*
      * Only accept printable characters.
      */
@@ -936,14 +943,45 @@ static void cmd_nopometer(int argc, char **argv)
     print(" nops/sec\n");
 }
 
+/* shell.c */
+static int want_desktop = 0;
+
 static void cmd_desktop(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+    want_desktop = 1;
+}
 
-    shell_ui_taken_over = 1;
+int shell_wants_desktop(void)
+{
+    if (want_desktop) {
+        want_desktop = 0;
+        return 1;
+    }
+    return 0;
+}
 
-    desktop_enter();
+void shell_set_desktop_active(int active)
+{
+    desktop_active = active;
+}
+
+int shell_is_desktop_active(void)
+{
+    return desktop_active;
+}
+
+static volatile int desktop_exit_requested = 0;
+
+void shell_request_desktop_exit(void) { desktop_exit_requested = 1; }
+int  shell_desktop_should_exit(void)
+{
+    if (desktop_exit_requested) {
+        desktop_exit_requested = 0;
+        return 1;
+    }
+    return 0;
 }
 
 static void fat_normalize_path(const char *in, char *out, int max)
@@ -1170,6 +1208,62 @@ static void cmd_fatmkdir(int argc, char **argv)
     }
 }
 
+static void cmd_fat32img(int argc, char **argv)
+{
+    if (argc < 2) {
+        print("usage: fat32img <file.bmp>\n");
+        return;
+    }
+
+    char path[FAT32_MAX_NAME];
+    fat_resolve(argv[1], path, FAT32_MAX_NAME);
+
+    if (fatimg_view_bmp(path) < 0)
+        return;
+
+    /* Return to a fresh shell after the image closes. */
+    framebuffer_clear(COLOR_WAVE_BG);
+}
+
+static void cmd_loadfont(int argc, char **argv)
+{
+    if (argc < 2) {
+        print("usage: loadfont <path> [size]\n");
+        return;
+    }
+
+    char path[FAT32_MAX_NAME];
+    fat_resolve(argv[1], path, FAT32_MAX_NAME);
+
+    float size = 16.0f;
+    if (argc >= 3) {
+        int s = 0;
+        const char *p = argv[2];
+        while (*p >= '0' && *p <= '9')
+            s = s * 10 + (*p++ - '0');
+        if (s > 0 && s <= 128)
+            size = (float)s;
+    }
+
+    print("[loadfont] reading ");
+    print(path);
+    print("\n");
+
+    int r = font_ttf_load(path, size);
+
+    print("[loadfont] result=");
+    print_u64((u64)r);
+    print(" ready=");
+    print_u64((u64)font_ttf_ready());
+    print("\n");
+
+    if (r == 0) {
+        print("[loadfont] font loaded\n");
+    } else {
+        print("[loadfont] load failed\n");
+    }
+}
+
 /* ---------- command table ---------- */
 
 struct command {
@@ -1202,11 +1296,12 @@ static const struct command commands[] = {
     { "wss",      cmd_wss,       "run a .wss script" },
     { "fatls", cmd_fatls, "list FAT32 root" },
     { "fatcd",     cmd_fatcd,     "change FAT32 directory" },
-    { "fatls",     cmd_fatls,     "list FAT32 directory" },
     { "fatcat",    cmd_fatcat,    "print FAT32 file" },
     { "fatecho",   cmd_fatecho,   "write text to a FAT32 file" },
     { "fatrm",     cmd_fatrm,     "delete a FAT32 file" },
     { "fatmkdir",  cmd_fatmkdir,  "create a FAT32 directory" },
+    { "fat32img", cmd_fat32img, "view a BMP file from FAT32" },
+    { "loadfont", cmd_loadfont, "load a TTF font" },
     { NULL, NULL, NULL },
 };
 
