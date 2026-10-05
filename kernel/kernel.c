@@ -14,6 +14,7 @@
 #include "fatimg.h"
 #include "font_ttf.h"
 #include "types.h"
+#include "thread.h"
 
 
 static void show_welcome(void)
@@ -102,6 +103,9 @@ void kmain(BootInfo *boot_info)
 
     idt_activate();
     print_tagged("OK", COLOR_LIGHT_GREEN, "Activated IDT\n");
+
+    thread_init();
+    print_tagged("OK", COLOR_LIGHT_GREEN, "Initialized threads\n");
 
     __asm__ volatile ("sti");
     print_tagged("OK", COLOR_LIGHT_GREEN, "STI!\n");
